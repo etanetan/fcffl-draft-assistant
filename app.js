@@ -173,6 +173,14 @@ function computeGone() {
 // ---------- recommendation engine (hero-RB build) ----------
 function recommend(gone) {
   const avail = players.filter(p => !isGone(p, gone));
+  // Talent decays exponentially down the board, so a fixed number of ranks is
+  // worth wildly different amounts at the top vs the bottom. Everything is
+  // scored through this curve; adjustments shift a player's effective rank
+  // rather than his points. Effective rank is deliberately allowed below 1 so
+  // the very top of the board doesn't compress into a tie.
+  const DECAY = 55;
+  const valueAt = r => 1000 * Math.exp((1 - r) / DECAY);
+
   const currentPick = allPicks().length + 1;
   const myNos = myPickNos();
   const nextMine = myNos.find(n => n >= currentPick) || myNos[myNos.length - 1];
@@ -201,37 +209,41 @@ function recommend(gone) {
   const scored = avail.slice(0, 60).map(p => {
     const why = [];
     const adp = p.adp || p.rank;
-    // Base value is rank-driven so talent stays primary; needs apply as bounded bonuses.
-    let score = Math.max(0, 250 - p.rank);
+    // Every adjustment below is measured in SPOTS ON THE BOARD, not points, and
+    // is cashed out through valueAt() at the end. A flat point bonus is worth
+    // the same number of ranks everywhere, which is wrong: jumping rank 17 -> 3
+    // is a different universe from jumping rank 117 -> 103. Spots keep each
+    // nudge honest at both ends of the board.
+    let spots = 0;
 
     // hero-RB build: 1 anchor RB early, WRs through both flexes, elite TE/QB windows, RB2+ later
     if (p.pos === "RB") {
-      if (c.RB === 0 && round <= 3) { score += 20; why.push("hero RB anchor"); }
-      else if (c.RB >= 1 && round <= 6) score -= 16;
-      else if (round >= 7 && c.RB < 4) { score += 14; why.push("RB2/3 window"); }
+      if (c.RB === 0 && round <= 3) { spots += 7; why.push("hero RB anchor"); }
+      else if (c.RB >= 1 && round <= 6) spots -= 14;
+      else if (round >= 7 && c.RB < 4) { spots += 10; why.push("RB2/3 window"); }
     } else if (p.pos === "WR") {
-      if (c.WR < 6 && round <= 10) { score += 16; why.push("WR-through-flex build"); }
-      else if (c.WR >= 6) score -= 12;
+      if (c.WR < 6 && round <= 10) { spots += 6; why.push("WR-through-flex build"); }
+      else if (c.WR >= 6) spots -= 12;
     } else if (p.pos === "TE") {
       if (c.TE === 0) {
-        if (p.tier === 1) { score += 18; why.push("elite TE = flex cheat code"); }
-        else if (round >= 8) { score += 14; why.push("TE need"); }
-        else score -= 20;
-      } else score -= 45;
+        if (p.tier === 1) { spots += 7; why.push("elite TE = flex cheat code"); }
+        else if (round >= 8) { spots += 10; why.push("TE need"); }
+        else spots -= 18;
+      } else spots -= 40;
     } else if (p.pos === "QB") {
       if (c.QB === 0) {
-        if (p.tier <= 2 && round >= 4 && round <= 7) { score += 14; why.push("elite QB value window"); }
-        else if (round >= 8) { score += 18; why.push("QB need — this league drafts QBs late"); }
-        else score -= 25;
-      } else score -= round >= 13 ? 15 : 60;
+        if (p.tier <= 2 && round >= 4 && round <= 7) { spots += 8; why.push("elite QB value window"); }
+        else if (round >= 8) { spots += 12; why.push("QB need — this league drafts QBs late"); }
+        else spots -= 22;
+      } else spots -= round >= 13 ? 12 : 50;
     }
 
     const left = tierLeft[p.pos + p.tier] || 0;
-    if (left === 1) { score += 30; why.push(`LAST ${p.pos} in tier ${p.tier} — cliff after him`); }
-    else if (left === 2) { score += 14; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+    if (left === 1) { spots += 9; why.push(`LAST ${p.pos} in tier ${p.tier} — cliff after him`); }
+    else if (left === 2) { spots += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
 
     if (onClock && currentPick - adp > 4) {
-      score += Math.min(24, (currentPick - adp) / 2);
+      spots += Math.min(10, (currentPick - adp) / 3);
       why.push(`falling: ADP ${adp}, on the clock at ${currentPick}`);
     }
     // Availability projections only move the score when you're actually choosing.
@@ -245,28 +257,34 @@ function recommend(gone) {
     if (onClock) {
       if (adp > afterMine + 2) {
         // Snake turn: he should survive the round trip, so spend this pick elsewhere.
-        score -= 12;
+        spots -= 7;
         why.push(`can likely wait — ADP ${adp}, you pick again at #${afterMine}`);
       } else if (adp <= afterMine && adp >= nextMine - 2) {
-        score += 8;
+        spots += 4;
         why.push(`won't last to your next pick (#${afterMine})`);
       }
     } else if (adp > afterMine + 2) {
       why.push(`should last to #${afterMine}`);
     }
 
-    if (runPos && p.pos === runPos) { score += 10; why.push(`${runPos} run — ${runCounts[runPos]} of last 8 picks`); }
-    if (currentPick >= 105 && (p.upside || 0) >= 4) { score += 22; why.push("late-round ceiling swing"); }
-    if ((p.bust || 0) >= 4) { score -= 6; why.push("high bust risk"); }
-    if (/injury|susp/.test(p.note || "")) { score -= 4; why.push(`⚠ ${p.note}`); }
+    if (runPos && p.pos === runPos) { spots += 4; why.push(`${runPos} run — ${runCounts[runPos]} of last 8 picks`); }
+    if (currentPick >= 105 && (p.upside || 0) >= 4) { spots += 12; why.push("late-round ceiling swing"); }
+    if ((p.bust || 0) >= 4) { spots -= 4; why.push("high bust risk"); }
+    if (/injury|susp/.test(p.note || "")) { spots -= 3; why.push(`⚠ ${p.note}`); }
 
-    return { p, score, why };
+    return { p, score: valueAt(p.rank - spots), why };
   });
 
   scored.sort((a, b) => b.score - a.score);
-  // Keep the shortlist positionally diverse so the real alternatives are always visible.
+  // Keep the shortlist positionally diverse so the real alternatives are always
+  // visible — but never pad it. Filling five slots unconditionally is how a
+  // rank-17 TE ended up "recommended" at pick 8 just for being the best of his
+  // position. Anyone materially behind the leader is not a live option, so the
+  // list is allowed to come back short.
+  const cutoff = scored.length ? scored[0].score * 0.90 : 0;
   const list = [], perPos = {};
   for (const s of scored) {
+    if (list.length >= 3 && s.score < cutoff) break;
     if ((perPos[s.p.pos] || 0) >= 2) continue;
     perPos[s.p.pos] = (perPos[s.p.pos] || 0) + 1;
     list.push(s);
@@ -341,9 +359,12 @@ function render() {
   document.getElementById("rec-context").textContent = until <= 0
     ? `— YOU'RE ON THE CLOCK, pick #${nextMine} (R${round})`
     : `— best available now · your pick #${nextMine} (R${round})`;
+  // Raw curve values are four-digit and meaningless on their own; show each rec
+  // as a share of the top option so the number answers "how much closer is he?"
+  const topScore = list.length ? list[0].score : 1;
   document.getElementById("recs").innerHTML = list.map((r, i) => `
     <div class="rec ${i === 0 ? "top" : ""}">
-      <span class="score">${Math.round(r.score)}</span>
+      <span class="score">${Math.round((r.score / topScore) * 100)}</span>
       <div class="name"><span class="pos-${r.p.pos}">${r.p.pos}</span> ${r.p.name} <span style="color:var(--dim)">${r.p.team} · rk ${r.p.rank} · ADP ${r.p.adp || "—"} · T${r.p.tier}</span> ${stars(r.p.upside, "up")}</div>
       <div class="why">${r.why.join(" · ") || "best available"}</div>
     </div>`).join("");
