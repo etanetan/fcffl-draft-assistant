@@ -198,6 +198,12 @@ function fitSpots(p, c, round, tierLeft) {
   // hero-RB build: 1 anchor RB early, WRs through both flexes, elite TE/QB windows, RB2+ later
   if (p.pos === "RB") {
     if (c.RB === 0 && round <= 3) { spots += 7; why.push("hero RB anchor"); }
+    // Hero RB defers RB2 to load WRs first — but that only holds while you're
+    // actually still short at WR. Once the WR corps is built and you're still
+    // on one back, RB2 IS the need, and the flat early-round penalty was
+    // burying it: sims from pick 56 with 1 RB / 3 WR had a tier-2 QB surviving
+    // to the next turn 81% of the time but a tier-4 RB only 32%.
+    else if (c.RB === 1 && c.WR >= 3 && round >= 4) { spots += 5; why.push("RB2 need — WR corps already built"); }
     else if (c.RB >= 1 && round <= 6) spots -= 14;
     else if (round >= 7 && c.RB < 4) { spots += 10; why.push("RB2/3 window"); }
   } else if (p.pos === "WR") {
