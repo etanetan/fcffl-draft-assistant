@@ -375,7 +375,7 @@ function recommend(gone) {
   // won't win on the pair either.
   if (USE_LOOKAHEAD) {
     try {
-      const cands = scored.slice(0, 10);
+      const cands = scored.slice(0, 14);
       const rng = mulberry32(currentPick * 7919 + avail.length);
       const la = lookahead(cands, avail, c, nextMine, afterMine, rng, 20);
       if (la) {
@@ -387,29 +387,37 @@ function recommend(gone) {
             s.why.push(`then likely ${info.partner} at #${afterMine} (${Math.round(info.partnerOdds * 100)}% of sims)`);
           }
         }
-        // Anything not simulated keeps its solo score and sorts below on pairs.
+        // Pair scores and solo scores aren't the same currency, so the shortlist
+        // must not mix them — restrict the pool to what was actually simulated.
+        // These were already the top candidates by solo score, so nobody outside
+        // the set was a live option anyway.
         cands.sort((a, b) => (b.pairScore || 0) - (a.pairScore || 0));
-        for (let i = 0; i < cands.length; i++) scored[i] = cands[i];
+        scored.length = 0;
+        scored.push(...cands);
       }
     } catch (e) {
       console.warn("lookahead failed, falling back to solo scoring", e);
     }
   }
   // Keep the shortlist positionally diverse so the real alternatives are always
-  // visible — but never pad it. Filling five slots unconditionally is how a
-  // rank-17 TE ended up "recommended" at pick 8 just for being the best of his
-  // position. Anyone materially behind the leader is not a live option, so the
-  // list is allowed to come back short.
-  // Pair scores are the sum of two picks, so their spread is compressed
-  // relative to solo scores — the cutoff has to be tighter to mean the same
-  // thing.
+  // visible. Five options, but graded rather than padded: filling slots
+  // unconditionally is how a rank-17 TE ended up "recommended" at pick 8 just
+  // for being the best of his position. Anyone inside STRONG is a genuine
+  // co-contender; between STRONG and FLOOR is a real but clearly worse option
+  // and gets dimmed; past FLOOR isn't shown at all, so the list can still come
+  // back short in a thin spot.
+  // Pair scores sum two picks, so their spread is compressed relative to solo
+  // scores and both thresholds have to be tighter to mean the same thing.
   const key = s => (s.pairScore != null ? s.pairScore : s.score);
-  const cutoff = scored.length ? key(scored[0]) * (USE_LOOKAHEAD ? 0.95 : 0.90) : 0;
+  const STRONG = USE_LOOKAHEAD ? 0.95 : 0.90;
+  const FLOOR  = USE_LOOKAHEAD ? 0.85 : 0.78;
+  const top = scored.length ? key(scored[0]) : 0;
   const list = [], perPos = {};
   for (const s of scored) {
-    if (list.length >= 3 && key(s) < cutoff) break;
+    if (key(s) < top * FLOOR) break;
     if ((perPos[s.p.pos] || 0) >= 2) continue;
     perPos[s.p.pos] = (perPos[s.p.pos] || 0) + 1;
+    s.marginal = key(s) < top * STRONG;
     list.push(s);
     if (list.length === 5) break;
   }
@@ -487,7 +495,7 @@ function render() {
   const val = r => (r.pairScore != null ? r.pairScore : r.score);
   const topScore = list.length ? val(list[0]) : 1;
   document.getElementById("recs").innerHTML = list.map((r, i) => `
-    <div class="rec ${i === 0 ? "top" : ""}">
+    <div class="rec ${i === 0 ? "top" : ""} ${r.marginal ? "marginal" : ""}">
       <span class="score">${Math.round((val(r) / topScore) * 100)}</span>
       <div class="name"><span class="pos-${r.p.pos}">${r.p.pos}</span> ${r.p.name} <span style="color:var(--dim)">${r.p.team} · rk ${r.p.rank} · ADP ${r.p.adp || "—"} · T${r.p.tier}</span> ${stars(r.p.upside, "up")}</div>
       <div class="why">${r.why.join(" · ") || "best available"}</div>

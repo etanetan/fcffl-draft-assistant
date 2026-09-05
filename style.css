@@ -30,6 +30,10 @@ h2 span { text-transform: none; letter-spacing: 0; }
 .rec .name { font-weight: 700; }
 .rec .why { color: var(--dim); font-size: 12px; margin-top: 2px; }
 .rec.top { border-color: var(--accent); }
+/* Shown as a real option but visibly a step down from the co-contenders above,
+   so a thin board never reads like five equivalent picks. */
+.rec.marginal { opacity: .68; border-style: dashed; }
+.rec.marginal .score { color: var(--dim); }
 .rec .score { float: right; color: var(--accent); font-weight: 700; }
 
 #roster .slot { display: flex; gap: 8px; padding: 3px 0; font-size: 13px; }
@@ -111,8 +115,9 @@ tr.mine-row td { background: #14263d !important; }
   .stars { font-size: 9px; letter-spacing: 0; }
   .taken { font-size: 10px; }
   .nm { font-size: 12px; }
-  /* Recs are the payload on a phone — keep the board within a short scroll. */
-  #recs .rec:nth-child(n+4) { display: none; }
+  /* Recs are the payload on a phone, so show the full shortlist; the board is
+     one scroll away regardless. */
+  #recs .rec { padding: 7px 9px; margin-bottom: 6px; }
 }
 
 footer { padding: 10px 18px 24px; }
