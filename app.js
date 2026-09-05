@@ -118,7 +118,10 @@ async function fetchDraftMeta() {
 
 async function poll() {
   try {
-    const r = await fetch(`https://api.sleeper.app/v1/draft/${CONFIG.draftId}/picks`);
+    // no-store: without it the browser happily serves a cached picks array and
+    // the board silently stops advancing mid-draft.
+    const r = await fetch(`https://api.sleeper.app/v1/draft/${CONFIG.draftId}/picks`,
+                          { cache: "no-store" });
     if (r.ok) {
       realPicks = await r.json();
       document.getElementById("sync-info").textContent =
@@ -226,7 +229,11 @@ function recommend(gone) {
       else if (c.WR >= 6) spots -= 12;
     } else if (p.pos === "TE") {
       if (c.TE === 0) {
-        if (p.tier === 1) { spots += 7; why.push("elite TE = flex cheat code"); }
+        // Elite TE is an R2+ luxury, not an R1 one. In round 1 a top-5 overall
+        // skill player is simply worth more than the best TE, so the flex-cheat-code
+        // bonus doesn't apply yet — wanting an elite TE eventually is not a reason
+        // to spend a premium pick on one.
+        if (p.tier === 1 && round >= 2) { spots += 5; why.push("elite TE = flex cheat code"); }
         else if (round >= 8) { spots += 10; why.push("TE need"); }
         else spots -= 18;
       } else spots -= 40;
@@ -400,6 +407,9 @@ function stars(n, cls) {
 function renderBoard(gone) {
   const hideDrafted = document.getElementById("hide-drafted").checked;
   const list = players.filter(p => activeTab === "ALL" || p.pos === activeTab);
+  // Tier bands only mean something within a position (an RB tier 1 and a WR
+  // tier 1 are unrelated), so the ALL view can't group by them — there the tier
+  // rides along in the POS cell as RB1/WR2/etc.
   const byTier = activeTab !== "ALL";
   let rows = "", lastTier = null;
 
