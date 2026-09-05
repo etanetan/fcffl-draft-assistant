@@ -174,15 +174,128 @@ function computeGone() {
 }
 
 // ---------- recommendation engine (hero-RB build) ----------
+
+// Talent decays exponentially down the board, so a fixed number of ranks is
+// worth wildly different amounts at the top vs the bottom. Everything is
+// scored through this curve; adjustments shift a player's effective rank
+// rather than his points. Effective rank is deliberately allowed below 1 so
+// the very top of the board doesn't compress into a tie.
+const DECAY = 55;
+const valueAt = r => 1000 * Math.exp((1 - r) / DECAY);
+
+// Score each pick together with what the sim expects to survive to your next
+// turn, rather than in isolation. Set false to fall back to solo scoring.
+const USE_LOOKAHEAD = true;
+
+// Roster-fit portion of the score, split out so it can also be applied to a
+// HYPOTHETICAL roster during lookahead ("if I take the TE now, what does my
+// board look like next turn?"). Pick-timing terms stay in recommend() because
+// they only make sense for the pick actually in front of you.
+function fitSpots(p, c, round, tierLeft) {
+  const why = [];
+  let spots = 0;
+
+  // hero-RB build: 1 anchor RB early, WRs through both flexes, elite TE/QB windows, RB2+ later
+  if (p.pos === "RB") {
+    if (c.RB === 0 && round <= 3) { spots += 7; why.push("hero RB anchor"); }
+    else if (c.RB >= 1 && round <= 6) spots -= 14;
+    else if (round >= 7 && c.RB < 4) { spots += 10; why.push("RB2/3 window"); }
+  } else if (p.pos === "WR") {
+    if (c.WR < 6 && round <= 10) { spots += 6; why.push("WR-through-flex build"); }
+    else if (c.WR >= 6) spots -= 12;
+  } else if (p.pos === "TE") {
+    if (c.TE === 0) {
+      // Elite TE is an R2+ luxury, not an R1 one. In round 1 a top-5 overall
+      // skill player is simply worth more than the best TE, so the flex-cheat-code
+      // bonus doesn't apply yet — wanting an elite TE eventually is not a reason
+      // to spend a premium pick on one.
+      if (p.tier === 1 && round >= 2) { spots += 5; why.push("elite TE = flex cheat code"); }
+      else if (round >= 8) { spots += 10; why.push("TE need"); }
+      else spots -= 18;
+    } else spots -= 40;
+  } else if (p.pos === "QB") {
+    if (c.QB === 0) {
+      if (p.tier <= 2 && round >= 4 && round <= 7) { spots += 8; why.push("elite QB value window"); }
+      else if (round >= 8) { spots += 12; why.push("QB need — this league drafts QBs late"); }
+      else spots -= 22;
+    } else spots -= round >= 13 ? 12 : 50;
+  }
+
+  const left = tierLeft[p.pos + p.tier] || 0;
+  if (left === 1) { spots += 9; why.push(`LAST ${p.pos} in tier ${p.tier} — cliff after him`); }
+  else if (left === 2) { spots += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+
+  return { spots, why };
+}
+
+function countTiers(pool) {
+  const t = {};
+  for (const p of pool) t[p.pos + p.tier] = (t[p.pos + p.tier] || 0) + 1;
+  return t;
+}
+
+// Seeded so the shortlist doesn't reshuffle on every 5s poll.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The actual question at any pick is not "who is best right now" but "which
+// PAIR do I end up with across this pick and my next one". Taking the elite TE
+// at 32 is only correct if the WR still sitting there at 41 is nearly as good
+// as the WR you'd have taken at 32. So: for each candidate, play the draft
+// forward to your next turn with opponents drafting near ADP, then add the
+// value of the best player left for you there.
+function lookahead(cands, avail, counts, nextMine, afterMine, rng, trials) {
+  const gap = afterMine - nextMine - 1;          // opponent picks in between
+  if (gap <= 0) return null;
+  const nextRound = Math.ceil(afterMine / CONFIG.teams);
+  const out = new Map();
+
+  for (const cand of cands) {
+    const c2 = { ...counts };
+    c2[cand.p.pos] = (c2[cand.p.pos] || 0) + 1;
+    let total = 0;
+    const partnerTally = new Map();
+
+    for (let t = 0; t < trials; t++) {
+      // Opponents take the lowest (ADP + noise) still on the board.
+      const taken = new Set([cand.p.key]);
+      for (let g = 0; g < gap; g++) {
+        let bestKey = null, bestVal = Infinity;
+        for (let i = 0; i < avail.length && i < 45; i++) {
+          const p = avail[i];
+          if (taken.has(p.key)) continue;
+          const v = (p.adp || p.rank) + (rng() - 0.5) * 16;
+          if (v < bestVal) { bestVal = v; bestKey = p.key; }
+        }
+        if (bestKey) taken.add(bestKey);
+      }
+      const pool = avail.filter(p => !taken.has(p.key));
+      const tl2 = countTiers(pool);
+      let best = null, bestScore = -Infinity;
+      for (let i = 0; i < pool.length && i < 40; i++) {
+        const p = pool[i];
+        const s = valueAt(p.rank - fitSpots(p, c2, nextRound, tl2).spots);
+        if (s > bestScore) { bestScore = s; best = p; }
+      }
+      total += bestScore;
+      if (best) partnerTally.set(best.name, (partnerTally.get(best.name) || 0) + 1);
+    }
+
+    const partner = [...partnerTally.entries()].sort((a, b) => b[1] - a[1])[0];
+    out.set(cand.p.key, { nextValue: total / trials, partner: partner ? partner[0] : null,
+                          partnerOdds: partner ? partner[1] / trials : 0 });
+  }
+  return out;
+}
+
 function recommend(gone) {
   const avail = players.filter(p => !isGone(p, gone));
-  // Talent decays exponentially down the board, so a fixed number of ranks is
-  // worth wildly different amounts at the top vs the bottom. Everything is
-  // scored through this curve; adjustments shift a player's effective rank
-  // rather than his points. Effective rank is deliberately allowed below 1 so
-  // the very top of the board doesn't compress into a tie.
-  const DECAY = 55;
-  const valueAt = r => 1000 * Math.exp((1 - r) / DECAY);
 
   const currentPick = allPicks().length + 1;
   const myNos = myPickNos();
@@ -210,44 +323,14 @@ function recommend(gone) {
   const onClock = currentPick >= nextMine;
 
   const scored = avail.slice(0, 60).map(p => {
-    const why = [];
     const adp = p.adp || p.rank;
-    // Every adjustment below is measured in SPOTS ON THE BOARD, not points, and
-    // is cashed out through valueAt() at the end. A flat point bonus is worth
-    // the same number of ranks everywhere, which is wrong: jumping rank 17 -> 3
-    // is a different universe from jumping rank 117 -> 103. Spots keep each
-    // nudge honest at both ends of the board.
-    let spots = 0;
-
-    // hero-RB build: 1 anchor RB early, WRs through both flexes, elite TE/QB windows, RB2+ later
-    if (p.pos === "RB") {
-      if (c.RB === 0 && round <= 3) { spots += 7; why.push("hero RB anchor"); }
-      else if (c.RB >= 1 && round <= 6) spots -= 14;
-      else if (round >= 7 && c.RB < 4) { spots += 10; why.push("RB2/3 window"); }
-    } else if (p.pos === "WR") {
-      if (c.WR < 6 && round <= 10) { spots += 6; why.push("WR-through-flex build"); }
-      else if (c.WR >= 6) spots -= 12;
-    } else if (p.pos === "TE") {
-      if (c.TE === 0) {
-        // Elite TE is an R2+ luxury, not an R1 one. In round 1 a top-5 overall
-        // skill player is simply worth more than the best TE, so the flex-cheat-code
-        // bonus doesn't apply yet — wanting an elite TE eventually is not a reason
-        // to spend a premium pick on one.
-        if (p.tier === 1 && round >= 2) { spots += 5; why.push("elite TE = flex cheat code"); }
-        else if (round >= 8) { spots += 10; why.push("TE need"); }
-        else spots -= 18;
-      } else spots -= 40;
-    } else if (p.pos === "QB") {
-      if (c.QB === 0) {
-        if (p.tier <= 2 && round >= 4 && round <= 7) { spots += 8; why.push("elite QB value window"); }
-        else if (round >= 8) { spots += 12; why.push("QB need — this league drafts QBs late"); }
-        else spots -= 22;
-      } else spots -= round >= 13 ? 12 : 50;
-    }
-
-    const left = tierLeft[p.pos + p.tier] || 0;
-    if (left === 1) { spots += 9; why.push(`LAST ${p.pos} in tier ${p.tier} — cliff after him`); }
-    else if (left === 2) { spots += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+    // Every adjustment is measured in SPOTS ON THE BOARD, not points, and is
+    // cashed out through valueAt() at the end. A flat point bonus is worth the
+    // same number of ranks everywhere, which is wrong: jumping rank 17 -> 3 is
+    // a different universe from jumping rank 117 -> 103.
+    const fit = fitSpots(p, c, round, tierLeft);
+    const why = fit.why;
+    let spots = fit.spots;
 
     if (onClock && currentPick - adp > 4) {
       spots += Math.min(10, (currentPick - adp) / 3);
@@ -261,13 +344,15 @@ function recommend(gone) {
     if (!onClock && adp < nextMine) {
       why.push(`likely gone by #${nextMine} (ADP ${adp})`);
     }
+    // These two are crude proxies for "what survives the round trip". When the
+    // lookahead sim runs it measures that directly, so leave the annotation but
+    // drop the score nudge rather than counting the same effect twice.
     if (onClock) {
       if (adp > afterMine + 2) {
-        // Snake turn: he should survive the round trip, so spend this pick elsewhere.
-        spots -= 7;
+        if (!USE_LOOKAHEAD) spots -= 7;
         why.push(`can likely wait — ADP ${adp}, you pick again at #${afterMine}`);
       } else if (adp <= afterMine && adp >= nextMine - 2) {
-        spots += 4;
+        if (!USE_LOOKAHEAD) spots += 4;
         why.push(`won't last to your next pick (#${afterMine})`);
       }
     } else if (adp > afterMine + 2) {
@@ -283,15 +368,46 @@ function recommend(gone) {
   });
 
   scored.sort((a, b) => b.score - a.score);
+
+  // Pair value: score this pick together with what the sim says survives to
+  // your next one. Only the genuine contenders are simulated — running it on
+  // all 60 would be wasted work, since a player who can't win on his own value
+  // won't win on the pair either.
+  if (USE_LOOKAHEAD) {
+    try {
+      const cands = scored.slice(0, 10);
+      const rng = mulberry32(currentPick * 7919 + avail.length);
+      const la = lookahead(cands, avail, c, nextMine, afterMine, rng, 20);
+      if (la) {
+        for (const s of cands) {
+          const info = la.get(s.p.key);
+          if (!info) continue;
+          s.pairScore = s.score + info.nextValue;
+          if (info.partner) {
+            s.why.push(`then likely ${info.partner} at #${afterMine} (${Math.round(info.partnerOdds * 100)}% of sims)`);
+          }
+        }
+        // Anything not simulated keeps its solo score and sorts below on pairs.
+        cands.sort((a, b) => (b.pairScore || 0) - (a.pairScore || 0));
+        for (let i = 0; i < cands.length; i++) scored[i] = cands[i];
+      }
+    } catch (e) {
+      console.warn("lookahead failed, falling back to solo scoring", e);
+    }
+  }
   // Keep the shortlist positionally diverse so the real alternatives are always
   // visible — but never pad it. Filling five slots unconditionally is how a
   // rank-17 TE ended up "recommended" at pick 8 just for being the best of his
   // position. Anyone materially behind the leader is not a live option, so the
   // list is allowed to come back short.
-  const cutoff = scored.length ? scored[0].score * 0.90 : 0;
+  // Pair scores are the sum of two picks, so their spread is compressed
+  // relative to solo scores — the cutoff has to be tighter to mean the same
+  // thing.
+  const key = s => (s.pairScore != null ? s.pairScore : s.score);
+  const cutoff = scored.length ? key(scored[0]) * (USE_LOOKAHEAD ? 0.95 : 0.90) : 0;
   const list = [], perPos = {};
   for (const s of scored) {
-    if (list.length >= 3 && s.score < cutoff) break;
+    if (list.length >= 3 && key(s) < cutoff) break;
     if ((perPos[s.p.pos] || 0) >= 2) continue;
     perPos[s.p.pos] = (perPos[s.p.pos] || 0) + 1;
     list.push(s);
@@ -368,10 +484,11 @@ function render() {
     : `— best available now · your pick #${nextMine} (R${round})`;
   // Raw curve values are four-digit and meaningless on their own; show each rec
   // as a share of the top option so the number answers "how much closer is he?"
-  const topScore = list.length ? list[0].score : 1;
+  const val = r => (r.pairScore != null ? r.pairScore : r.score);
+  const topScore = list.length ? val(list[0]) : 1;
   document.getElementById("recs").innerHTML = list.map((r, i) => `
     <div class="rec ${i === 0 ? "top" : ""}">
-      <span class="score">${Math.round((r.score / topScore) * 100)}</span>
+      <span class="score">${Math.round((val(r) / topScore) * 100)}</span>
       <div class="name"><span class="pos-${r.p.pos}">${r.p.pos}</span> ${r.p.name} <span style="color:var(--dim)">${r.p.team} · rk ${r.p.rank} · ADP ${r.p.adp || "—"} · T${r.p.tier}</span> ${stars(r.p.upside, "up")}</div>
       <div class="why">${r.why.join(" · ") || "best available"}</div>
     </div>`).join("");
