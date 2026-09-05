@@ -234,18 +234,25 @@ function recommend(gone) {
       score += Math.min(24, (currentPick - adp) / 2);
       why.push(`falling: ADP ${adp}, on the clock at ${currentPick}`);
     }
+    // Availability projections only move the score when you're actually choosing.
+    // Off the clock this panel answers "who's on the board right now", so ADP
+    // forecasts are annotations — otherwise every elite player is buried by a
+    // guess that he won't survive to your turn, which is exactly when you most
+    // want to see that he's still sitting there.
     if (!onClock && adp < nextMine) {
-      // Looking ahead — the further below your pick his ADP is, the likelier he's gone.
-      score -= Math.min(45, (nextMine - adp) * 6);
       why.push(`likely gone by #${nextMine} (ADP ${adp})`);
     }
-    if (adp > afterMine + 2) {
-      // Snake turn: he should survive the round trip, so spend this pick elsewhere.
-      score -= 12;
-      why.push(`can likely wait — ADP ${adp}, you pick again at #${afterMine}`);
-    } else if (adp <= afterMine && adp >= nextMine - 2) {
-      score += 8;
-      why.push(`won't last to your next pick (#${afterMine})`);
+    if (onClock) {
+      if (adp > afterMine + 2) {
+        // Snake turn: he should survive the round trip, so spend this pick elsewhere.
+        score -= 12;
+        why.push(`can likely wait — ADP ${adp}, you pick again at #${afterMine}`);
+      } else if (adp <= afterMine && adp >= nextMine - 2) {
+        score += 8;
+        why.push(`won't last to your next pick (#${afterMine})`);
+      }
+    } else if (adp > afterMine + 2) {
+      why.push(`should last to #${afterMine}`);
     }
 
     if (runPos && p.pos === runPos) { score += 10; why.push(`${runPos} run — ${runCounts[runPos]} of last 8 picks`); }
@@ -331,7 +338,9 @@ function render() {
     ? "YOU ARE ON THE CLOCK" : `Your pick: #${nextMine} (in ${until})`;
 
   // recommendations
-  document.getElementById("rec-context").textContent = `— for your pick #${nextMine} (R${round})`;
+  document.getElementById("rec-context").textContent = until <= 0
+    ? `— YOU'RE ON THE CLOCK, pick #${nextMine} (R${round})`
+    : `— best available now · your pick #${nextMine} (R${round})`;
   document.getElementById("recs").innerHTML = list.map((r, i) => `
     <div class="rec ${i === 0 ? "top" : ""}">
       <span class="score">${Math.round(r.score)}</span>
