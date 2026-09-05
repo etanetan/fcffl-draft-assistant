@@ -75,8 +75,20 @@ async function syncTeams() {
   render();
 }
 
+// The sticky header changes height when its pills wrap (phone, rotation, zoom,
+// longer status text once the draft goes live). Anything pinned below it has to
+// follow, or the top row of the board hides underneath.
+function syncHeaderOffset() {
+  const h = document.querySelector("header");
+  if (!h) return;
+  document.documentElement.style.setProperty("--hdr", Math.round(h.getBoundingClientRect().height) + "px");
+}
+
 function init() {
   players = (window.RANKINGS || []).map(p => ({ ...p, key: keyOf(p.name, p.pos) }));
+  syncHeaderOffset();
+  if (window.ResizeObserver) new ResizeObserver(syncHeaderOffset).observe(document.querySelector("header"));
+  window.addEventListener("resize", syncHeaderOffset);
   fetchDraftMeta();
   syncTeams();
   poll();

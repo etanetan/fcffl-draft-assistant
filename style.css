@@ -3,6 +3,9 @@
   --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2a3550;
   --text: #e8edf7; --dim: #8b97b0; --accent: #4da3ff; --green: #3ddc84;
   --red: #ff5d6c; --gold: #ffc94d;
+  /* Real height of the sticky header, measured at runtime by syncHeaderOffset().
+     Hardcoding it breaks the moment the header wraps (narrow window, zoom, long pill text). */
+  --hdr: 62px;
 }
 body { background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; }
 
@@ -16,7 +19,7 @@ header { display: flex; justify-content: space-between; align-items: center; fle
 .pill.live { border-color: var(--green); color: var(--green); }
 
 main { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 14px 18px; align-items: start; }
-#left { position: sticky; top: 62px; max-height: calc(100vh - 76px); overflow-y: auto; }
+#left { position: sticky; top: calc(var(--hdr) + 8px); max-height: calc(100vh - var(--hdr) - 20px); overflow-y: auto; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } #left { position: static; max-height: none; } }
 
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
@@ -44,7 +47,7 @@ h2 span { text-transform: none; letter-spacing: 0; }
 
 table.sheet { width: 100%; border-collapse: collapse; font-size: 13px; }
 .sheet thead th { text-align: left; color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .07em;
-  padding: 6px; border-bottom: 2px solid var(--line); position: sticky; top: 56px; background: var(--panel); z-index: 5; }
+  padding: 6px; border-bottom: 2px solid var(--line); position: sticky; top: var(--hdr); background: var(--panel); z-index: 5; }
 .sheet td { padding: 5px 6px; border-bottom: 1px solid #1e2740; }
 .sheet tr.player { cursor: pointer; }
 .sheet tr.player:hover td { background: var(--panel2); }
@@ -75,16 +78,26 @@ tr.player.gone .nm { text-decoration: line-through; }
 .taken { color: var(--dim); font-size: 11px; white-space: nowrap; }
 tr.mine-row td { background: #14263d !important; }
 
-#board { overflow-x: auto; }
+/* No overflow here on purpose: an overflow container would become the sticky
+   scrollport for thead, which pins the header row *inside* the table body and
+   buries row 1. The table is responsive instead (see the 700px block). */
+#board { min-width: 0; }
+/* break-word, not anywhere: only splits a name that genuinely can't fit. */
+.sheet .nm { overflow-wrap: break-word; }
 @media (max-width: 700px) {
-  header { padding: 8px 10px; }
+  /* Header is sticky, so every pixel here is a pixel of board you can't see. */
+  header { padding: 7px 10px; gap: 5px; }
   .brand { font-size: 15px; }
-  .brand .sub { display: block; margin-left: 0; }
+  .brand .sub { display: block; margin-left: 0; font-size: 11px; }
+  .pill { padding: 2px 9px; font-size: 11px; }
+  #statusbar { gap: 5px; }
   main { padding: 8px 10px; gap: 8px; }
   section { padding: 9px; margin-bottom: 8px; }
   .sheet td, .sheet thead th { padding: 4px 3px; font-size: 12px; }
+  /* Drop TM and DRAFTED on a phone — the strikethrough already says "gone",
+     and the reclaimed width is what keeps player names on one line. */
   .sheet td.tm, .sheet th:nth-child(4) { display: none; }
-  .sheet thead th { top: 0; }
+  .sheet td.taken, .sheet th:nth-child(9) { display: none; }
   .rec .why { font-size: 11px; }
   .stars { font-size: 9px; letter-spacing: 0; }
   .taken { font-size: 10px; }
