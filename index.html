@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FCFFL Draft Assistant</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">FCFFL Draft Assistant <span class="sub">etanetan · slot 8 · full PPR · 2 FLEX</span></div>
+  <div id="statusbar">
+    <span id="draft-status" class="pill">loading…</span>
+    <span id="clock" class="pill"></span>
+    <span id="mynext" class="pill accent"></span>
+  </div>
+</header>
+
+<main>
+  <aside id="left">
+    <section id="rec-panel">
+      <h2>Recommendations <span id="rec-context"></span></h2>
+      <div id="recs"></div>
+    </section>
+    <section id="roster-panel">
+      <h2>My Roster <span id="roster-count"></span></h2>
+      <div id="roster"></div>
+    </section>
+    <section id="ticker-panel">
+      <h2>Recent Picks</h2>
+      <div id="ticker"></div>
+    </section>
+  </aside>
+
+  <section id="board">
+    <div id="tabs">
+      <button data-pos="ALL" class="tab active">All</button>
+      <button data-pos="RB" class="tab">RB</button>
+      <button data-pos="WR" class="tab">WR</button>
+      <button data-pos="QB" class="tab">QB</button>
+      <button data-pos="TE" class="tab">TE</button>
+      <label class="toggle"><input type="checkbox" id="hide-drafted"> hide drafted</label>
+      <span id="sync-info"></span>
+    </div>
+    <div id="players"></div>
+  </section>
+</main>
+
+<footer>
+  <div id="sim-controls">
+    <strong>Test mode:</strong>
+    <button id="sim-pick">Simulate next pick</button>
+    <button id="sim-my-pick">Simulate MY pick (best rec)</button>
+    <button id="sim-reset">Reset sim</button>
+    <span class="hint">Tap any player row to manually mark drafted (if auto-match misses).</span>
+  </div>
+  <p class="note">
+    Ranks/ADP are a consensus compiled early Sept 2026 (FantasyPros, ESPN, FTN, Yahoo, RotoBaller, FFC);
+    ranks past ~130 are looser. Teams auto-correct from Sleeper's live player database each day.
+    Picks sync live from Sleeper every 5s. Sanity-check the top of the board against a live source on draft day.
+  </p>
+</footer>
+
+<script src="rankings.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
