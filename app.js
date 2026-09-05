@@ -448,8 +448,26 @@ function renderBoard(gone) {
   }
   const el = document.getElementById("players");
   el.innerHTML = `<table class="sheet">
-    <thead><tr><th>RK</th><th>PLAYER</th><th>POS</th><th>TM</th><th>ADP</th><th>+/-</th><th>UPSIDE</th><th>BUST</th><th>DRAFTED</th></tr></thead>
+    <thead><tr>
+      <th title="My consensus rank — where this board says he should go overall.">RK</th>
+      <th>PLAYER</th>
+      <th title="Position + tier. RB1 = tier-1 RB. Tap a position tab for tier bands and cliff warnings.">POS</th>
+      <th>TM</th>
+      <th title="Average Draft Position — where the market actually drafts him.">ADP</th>
+      <th class="help" id="th-val" title="ADP minus rank: how many picks of value he is. Green = he lasts longer than he's worth (bargain), red = you'd have to reach. Tap for details.">+/-</th>
+      <th title="Ceiling, 1-5. How big his best-case season is.">UPSIDE</th>
+      <th title="Floor risk, 1-5. How likely he busts.">BUST</th>
+      <th>DRAFTED</th>
+    </tr></thead>
     <tbody>${rows}</tbody></table>`;
+  // title= is useless on a phone, so the +/- header also toggles a real legend.
+  // The table is rebuilt on every poll, so this rebinds each render.
+  const vh = document.getElementById("th-val");
+  if (vh) vh.addEventListener("click", () => {
+    const lg = document.getElementById("legend");
+    lg.hidden = !lg.hidden;
+  });
+
   el.querySelectorAll("tr.player").forEach(row => row.addEventListener("click", () => {
     const k = row.dataset.key;
     if (manualGone.has(k)) manualGone.delete(k); else manualGone.add(k);
