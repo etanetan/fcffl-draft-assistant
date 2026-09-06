@@ -40,9 +40,18 @@ async function api(path) {
 }
 
 // ---------- setup ----------
+// Inline display, not just the `hidden` attribute: #setup carries display:flex
+// from the stylesheet, which outranks [hidden]{display:none}. Setting it here
+// keeps the toggle correct even against a stale cached stylesheet.
+function showPane(which) {
+  const setup = el("setup"), app = el("app");
+  setup.hidden = which !== "setup";
+  app.hidden = which !== "app";
+  setup.style.display = which === "setup" ? "flex" : "none";
+  app.style.display = which === "app" ? "block" : "none";
+}
 function showSetup(msg) {
-  el("setup").hidden = false;
-  el("app").hidden = true;
+  showPane("setup");
   if (msg) el("su-msg").textContent = msg;
 }
 
@@ -127,8 +136,8 @@ async function loadLeague(leagueId) {
     }
 
     buildPlayers();
-    el("setup").hidden = true;
-    el("app").hidden = false;
+    el("su-msg").textContent = "";
+    showPane("app");
     renderHeaderMeta();
     wireApp();
     render();
