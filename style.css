@@ -26,6 +26,8 @@ body { background: var(--bg); color: var(--text); font: 14px/1.45 -apple-system,
 .fld input { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
   border-radius: 8px; padding: 10px 12px; font-size: 15px; }
 .fld input:focus { outline: none; border-color: var(--accent); }
+/* Clearly a hint, not a value — the old placeholder was mistaken for filled-in text. */
+.fld input::placeholder { color: #55617a; opacity: 1; }
 .btn { width: 100%; background: var(--accent); color: #06101f; border: 0; border-radius: 8px;
   padding: 11px; font-size: 15px; font-weight: 700; cursor: pointer; }
 .btn:hover { filter: brightness(1.08); }

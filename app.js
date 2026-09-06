@@ -66,7 +66,13 @@ function showSetup(msg) {
 async function findLeagues() {
   const username = el("su-user").value.trim();
   const season = el("su-season").value.trim() || "2026";
-  if (!username) return;
+  // Returning silently here made the button look broken: the placeholder reads
+  // like a filled-in value, so an empty field is the easy mistake to make.
+  if (!username) {
+    el("su-msg").textContent = "Type your Sleeper username first.";
+    el("su-user").focus();
+    return;
+  }
   el("su-msg").textContent = "looking up " + username + "…";
   el("su-leagues").innerHTML = "";
   try {
