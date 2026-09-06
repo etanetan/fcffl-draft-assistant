@@ -3,16 +3,41 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FCFFL Draft Assistant</title>
+<title>Draft Assistant</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+
+<!-- ---------- setup: username -> league ---------- -->
+<div id="setup">
+  <div class="setup-card">
+    <h1>Draft Assistant</h1>
+    <p class="setup-sub">Ranks blended from FantasyPros, ESPN, Sleeper projections and live ADP,
+       then re-scored against your league's own settings.</p>
+
+    <label class="fld">
+      <span>Sleeper username</span>
+      <input id="su-user" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="etanetan">
+    </label>
+    <label class="fld">
+      <span>Season</span>
+      <input id="su-season" type="text" inputmode="numeric" value="2026">
+    </label>
+    <button id="su-go" class="btn">Find my leagues</button>
+    <div id="su-msg" class="setup-msg"></div>
+    <div id="su-leagues"></div>
+  </div>
+</div>
+
+<!-- ---------- main app ---------- -->
+<div id="app" hidden>
 <header>
-  <div class="brand">FCFFL Draft Assistant <span class="sub">etanetan · slot 8 · full PPR · 2 FLEX</span></div>
+  <div class="brand"><span id="lg-name">—</span> <span class="sub" id="lg-sub"></span></div>
   <div id="statusbar">
     <span id="draft-status" class="pill">loading…</span>
     <span id="clock" class="pill"></span>
     <span id="mynext" class="pill accent"></span>
+    <button id="switch-league" class="pill btn-pill">switch</button>
   </div>
 </header>
 
@@ -22,9 +47,10 @@
       <h2>Recommendations <span id="rec-context"></span></h2>
       <div id="recs"></div>
     </section>
-    <section id="roster-panel">
+    <section id="needs-panel">
       <h2>My Roster <span id="roster-count"></span></h2>
       <div id="roster"></div>
+      <div id="mypicks"></div>
     </section>
     <section id="ticker-panel">
       <h2>Recent Picks</h2>
@@ -35,44 +61,37 @@
   <section id="board">
     <div id="tabs">
       <button data-pos="ALL" class="tab active">All</button>
+      <button data-pos="QB" class="tab">QB</button>
       <button data-pos="RB" class="tab">RB</button>
       <button data-pos="WR" class="tab">WR</button>
-      <button data-pos="QB" class="tab">QB</button>
       <button data-pos="TE" class="tab">TE</button>
-      <label class="toggle"><input type="checkbox" id="hide-drafted"> hide drafted</label>
-      <span class="toggle">POS shows tier (RB1 = tier-1 RB) · tap a position for tier bands + cliffs</span>
+      <button data-pos="K" class="tab">K</button>
+      <button data-pos="DEF" class="tab">DEF</button>
+      <label class="toggle"><input type="checkbox" id="hide-drafted" checked> hide gone</label>
       <span id="sync-info"></span>
     </div>
     <div id="legend" hidden>
-      <b>+/- = ADP &minus; RK</b> — how many picks of value a player is.
-      <span class="lg-pos">+3 or better</span> he lasts later than he's worth, so you can wait and still get him.
-      <span class="lg-neg">&minus;3 or worse</span> the room drafts him ahead of his value, so taking him costs you a reach.
-      Blank means the market and this board agree.
-      <em>It compares this board to the market, so it inherits any error in my rank — treat a big green number as
-      "go look at him", not proof.</em>
-      <div class="lg-more"><b>UPSIDE / BUST</b> — ceiling and floor risk, 1&ndash;5. <b>RK</b> is my consensus rank;
-      <b>ADP</b> is where he actually goes. Tap this row to hide.</div>
+      <b>VOR</b> = projected points above the last startable player at that position <em>in your league</em>.
+      It is the number the recommendations actually rank on, and it is what makes a QB worth more in
+      superflex than in a 1-QB room without anyone hand-tuning a bonus.
+      <div class="lg-more">
+        <b>PTS</b> — season projection run through your league's exact scoring settings.
+        <b>ECR</b> — FantasyPros expert consensus rank (superflex board when your league is superflex).
+        <b>ADP</b> — where the market actually drafts him.
+        <span class="lg-pos">+</span>/<span class="lg-neg">&minus;</span> on ADP is value gained or given up versus this board.
+        Tap this row to hide.
+      </div>
     </div>
     <div id="players"></div>
   </section>
 </main>
 
 <footer>
-  <div id="sim-controls">
-    <strong>Test mode:</strong>
-    <button id="sim-pick">Simulate next pick</button>
-    <button id="sim-my-pick">Simulate MY pick (best rec)</button>
-    <button id="sim-reset">Reset sim</button>
-    <span class="hint">Tap any player row to manually mark drafted (if auto-match misses).</span>
-  </div>
-  <p class="note">
-    Ranks/ADP are a consensus compiled early Sept 2026 (FantasyPros, ESPN, FTN, Yahoo, RotoBaller, FFC);
-    ranks past ~130 are looser. Teams auto-correct from Sleeper's live player database each day.
-    Picks sync live from Sleeper every 5s. Sanity-check the top of the board against a live source on draft day.
-  </p>
+  <p class="note" id="src-note"></p>
 </footer>
+</div>
 
-<script src="rankings.js"></script>
+<script src="data.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

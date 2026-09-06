@@ -1,533 +1,514 @@
 "use strict";
 
-const CONFIG = {
-  draftId: "1367869106316926976",
-  myUserId: "315270787781124096",
-  mySlot: 8,
-  teams: 12,
-  rounds: 14,
-  pollMs: 5000,
+// Draft assistant. Nothing here is hardcoded to a league: you give it a Sleeper
+// username, it reads whatever league you pick, and every number on screen is
+// derived from that league's own scoring settings and roster slots.
+//
+// The chain is: raw projected stats (data.js)
+//   -> points, using league.scoring_settings
+//   -> VOR, using league.roster_positions x team count
+//   -> a blended rank (our model + FantasyPros ECR + ADP + ESPN)
+//   -> recommendations, which rank on what you LOSE by waiting a turn.
+
+const API = "https://api.sleeper.app/v1";
+const POLL_MS = 5000;
+const LS = { user: "da_user", season: "da_season", league: "da_league", manual: "da_manual_" };
+
+const S = {
+  season: "2026", username: "", userId: "",
+  league: null, scoring: {}, rosterPos: [], teams: 12,
+  superflex: false, ppr: 1,
+  rosters: [], users: {}, rosterById: {},
+  myRosterId: null, mySlot: null,
+  draft: null, picks: [], traded: [], keeperIds: new Set(),
+  players: [], byKey: new Map(),
+  manualGone: new Set(),
+  activeTab: "ALL", pollTimer: null,
 };
 
-const USERS = {
-  "315270787781124096": "etanetan",
-  "338472345645641728": "HenryMyos",
-  "439619168275263488": "charlieyouakim",
-  "441097256750280704": "jyouakim",
-  "448911379567472640": "davemyos",
-  "449690204052123648": "CJ129",
-  "449739408694833152": "28AllDay",
-  "449765829966295040": "JohnStruyk",
-  "522215629870362624": "ChampaignTornadoes",
-  "724476867326840832": "DStruyk",
-  "724709384508256256": "BenHur",
-  "726251080672968704": "Iguanas",
-};
+// ---------- helpers ----------
+const norm = s => (s || "").toLowerCase().replace(/[.'’`-]/g, "")
+  .replace(/\s+(jr|sr|ii|iii|iv|v)$/, "").replace(/\s+/g, " ").trim();
+const keyOf = (name, pos) => norm(name) + "|" + (pos || "").toUpperCase();
+const el = id => document.getElementById(id);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-// ---------- state ----------
-let players = [];            // enriched RANKINGS
-let realPicks = [];          // from Sleeper
-let simPicks = [];           // test mode
-let manualGone = new Set(JSON.parse(localStorage.getItem("fcffl_manual") || "[]"));
-let slotToUser = {};         // draft slot -> user_id
-let draftStatus = "loading";
-let activeTab = "ALL";
-
-function normName(s) {
-  return (s || "").toLowerCase()
-    .replace(/[.'’`-]/g, "")
-    .replace(/\s+(jr|sr|ii|iii|iv|v)\.?$/i, "")
-    .replace(/\s+/g, " ").trim();
+async function api(path) {
+  const r = await fetch(API + path, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${r.status} on ${path}`);
+  return r.json();
 }
-const keyOf = (name, pos) => normName(name) + "|" + (pos || "").toUpperCase();
 
-// Rankings are compiled by hand, so team assignments can go stale after trades/signings.
-// Sleeper's player database is authoritative — reconcile against it, cached for a day.
-async function syncTeams() {
-  const CACHE = "fcffl_teams_v1";
-  let map = null;
+// ---------- setup ----------
+function showSetup(msg) {
+  el("setup").hidden = false;
+  el("app").hidden = true;
+  if (msg) el("su-msg").textContent = msg;
+}
+
+async function findLeagues() {
+  const username = el("su-user").value.trim();
+  const season = el("su-season").value.trim() || "2026";
+  if (!username) return;
+  el("su-msg").textContent = "looking up " + username + "…";
+  el("su-leagues").innerHTML = "";
   try {
-    const c = JSON.parse(localStorage.getItem(CACHE) || "null");
-    if (c && Date.now() - c.at < 864e5) map = c.map;
-  } catch (e) { /* fall through to refetch */ }
-
-  if (!map) {
-    try {
-      const r = await fetch("https://api.sleeper.app/v1/players/nfl");
-      const all = await r.json();
-      map = {};
-      for (const id in all) {
-        const p = all[id];
-        if (!p.full_name || !["QB", "RB", "WR", "TE"].includes(p.position)) continue;
-        if (p.status === "Inactive" && !p.team) continue;
-        map[keyOf(p.full_name, p.position)] = p.team || "FA";
-      }
-      localStorage.setItem(CACHE, JSON.stringify({ at: Date.now(), map }));
-    } catch (e) { return; }
-  }
-
-  const fixed = [];
-  for (const p of players) {
-    const real = map[p.key];
-    if (real && real !== p.team) { fixed.push(`${p.name} ${p.team}→${real}`); p.team = real; }
-  }
-  if (fixed.length) console.log("team corrections:", fixed);
-  render();
-}
-
-// The sticky header changes height when its pills wrap (phone, rotation, zoom,
-// longer status text once the draft goes live). Anything pinned below it has to
-// follow, or the top row of the board hides underneath.
-function syncHeaderOffset() {
-  const h = document.querySelector("header");
-  if (!h) return;
-  document.documentElement.style.setProperty("--hdr", Math.round(h.getBoundingClientRect().height) + "px");
-}
-
-function init() {
-  players = (window.RANKINGS || []).map(p => ({ ...p, key: keyOf(p.name, p.pos) }));
-  syncHeaderOffset();
-  if (window.ResizeObserver) new ResizeObserver(syncHeaderOffset).observe(document.querySelector("header"));
-  window.addEventListener("resize", syncHeaderOffset);
-  fetchDraftMeta();
-  syncTeams();
-  poll();
-  setInterval(poll, CONFIG.pollMs);
-  document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
-    activeTab = b.dataset.pos;
-    document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === b));
-    render();
-  }));
-  document.getElementById("hide-drafted").addEventListener("change", render);
-  document.getElementById("sim-pick").addEventListener("click", simulatePick);
-  document.getElementById("sim-my-pick").addEventListener("click", simulateMyPick);
-  document.getElementById("sim-reset").addEventListener("click", () => { simPicks = []; render(); });
-}
-
-async function fetchDraftMeta() {
-  try {
-    const r = await fetch(`https://api.sleeper.app/v1/draft/${CONFIG.draftId}`);
-    const d = await r.json();
-    draftStatus = d.status;
-    if (d.draft_order) {
-      slotToUser = {};
-      for (const [uid, slot] of Object.entries(d.draft_order)) slotToUser[slot] = uid;
-    }
-  } catch (e) { /* offline ok */ }
-}
-
-async function poll() {
-  try {
-    // no-store: without it the browser happily serves a cached picks array and
-    // the board silently stops advancing mid-draft.
-    const r = await fetch(`https://api.sleeper.app/v1/draft/${CONFIG.draftId}/picks`,
-                          { cache: "no-store" });
-    if (r.ok) {
-      realPicks = await r.json();
-      document.getElementById("sync-info").textContent =
-        `synced ${new Date().toLocaleTimeString()} · ${realPicks.length} real picks`;
-      if (realPicks.length && draftStatus !== "complete") draftStatus = "drafting";
-    }
+    const user = await api(`/user/${encodeURIComponent(username)}`);
+    if (!user || !user.user_id) throw new Error("no such user");
+    S.username = user.display_name || username;
+    S.userId = user.user_id;
+    S.season = season;
+    const leagues = await api(`/user/${user.user_id}/leagues/nfl/${season}`);
+    if (!leagues.length) { el("su-msg").textContent = `No ${season} leagues for ${S.username}.`; return; }
+    el("su-msg").textContent = `${S.username} — ${leagues.length} league${leagues.length > 1 ? "s" : ""}:`;
+    el("su-leagues").innerHTML = leagues.map(l => {
+      const sf = (l.roster_positions || []).includes("SUPER_FLEX") ? "SUPERFLEX" : "";
+      const ppr = (l.scoring_settings || {}).rec;
+      const fmt = ppr >= 1 ? "PPR" : ppr > 0 ? "half-PPR" : "standard";
+      const kp = (l.settings || {}).max_keepers > 0 ? `${l.settings.max_keepers} keepers` : "";
+      return `<button class="lg-btn" data-id="${l.league_id}">
+        <b>${esc(l.name)}</b>
+        <span>${l.total_rosters}-team · ${fmt}${sf ? " · " + sf : ""}${kp ? " · " + kp : ""} · ${esc(l.status)}</span>
+      </button>`;
+    }).join("");
+    el("su-leagues").querySelectorAll(".lg-btn").forEach(b =>
+      b.addEventListener("click", () => {
+        localStorage.setItem(LS.user, S.username);
+        localStorage.setItem(LS.season, season);
+        localStorage.setItem(LS.league, b.dataset.id);
+        loadLeague(b.dataset.id);
+      }));
   } catch (e) {
-    document.getElementById("sync-info").textContent = "offline — using manual/sim marks";
+    el("su-msg").textContent = "Couldn't find that user — check the spelling. (" + e.message + ")";
   }
-  render();
 }
 
-// ---------- pick math ----------
-function allPicks() { return realPicks.length ? realPicks : simPicks; }
+async function loadLeague(leagueId) {
+  el("su-msg").textContent = "loading league…";
+  try {
+    const [league, rosters, users] = await Promise.all([
+      api(`/league/${leagueId}`), api(`/league/${leagueId}/rosters`), api(`/league/${leagueId}/users`),
+    ]);
+    S.league = league;
+    S.scoring = league.scoring_settings || {};
+    S.rosterPos = league.roster_positions || [];
+    S.teams = league.total_rosters || rosters.length || 12;
+    S.superflex = S.rosterPos.includes("SUPER_FLEX") ||
+      S.rosterPos.filter(p => p === "QB").length > 1;
+    S.ppr = S.scoring.rec || 0;
+    S.rosters = rosters;
+    S.users = Object.fromEntries(users.map(u => [u.user_id, u.display_name]));
+    S.rosterById = Object.fromEntries(rosters.map(r => [r.roster_id, r]));
 
-function slotForPickNo(no) {
-  const r = Math.ceil(no / CONFIG.teams);
-  const idx = (no - 1) % CONFIG.teams;
-  return r % 2 === 1 ? idx + 1 : CONFIG.teams - idx;
+    if (!S.userId) {
+      const me = users.find(u => (u.display_name || "").toLowerCase() === S.username.toLowerCase());
+      if (me) S.userId = me.user_id;
+    }
+    const mine = rosters.find(r => r.owner_id === S.userId) ||
+                 rosters.find(r => (r.co_owners || []).includes(S.userId));
+    S.myRosterId = mine ? mine.roster_id : null;
+
+    // Keepers are off the board before the first pick is made, and they are the
+    // whole reason a keeper league's board looks nothing like its ADP.
+    S.keeperIds = new Set();
+    for (const r of rosters) for (const k of (r.keepers || [])) S.keeperIds.add(String(k));
+
+    S.manualGone = new Set(JSON.parse(localStorage.getItem(LS.manual + leagueId) || "[]"));
+
+    if (league.draft_id) {
+      const [draft, picks, traded] = await Promise.all([
+        api(`/draft/${league.draft_id}`),
+        api(`/draft/${league.draft_id}/picks`).catch(() => []),
+        api(`/draft/${league.draft_id}/traded_picks`).catch(() => []),
+      ]);
+      S.draft = draft; S.picks = picks || []; S.traded = traded || [];
+      const order = draft.slot_to_roster_id || {};
+      for (const [slot, rid] of Object.entries(order)) if (rid === S.myRosterId) S.mySlot = Number(slot);
+    }
+
+    buildPlayers();
+    el("setup").hidden = true;
+    el("app").hidden = false;
+    renderHeaderMeta();
+    wireApp();
+    render();
+    if (S.pollTimer) clearInterval(S.pollTimer);
+    S.pollTimer = setInterval(poll, POLL_MS);
+  } catch (e) {
+    showSetup("Couldn't load that league: " + e.message);
+  }
 }
-function myPickNos() {
+
+// ---------- scoring ----------
+// Multiply every projected stat by whatever this league pays for it. Keys the
+// league doesn't score simply never match, so a standard league and a
+// first-down-bonus league both come out right with no special cases.
+const NON_SCORING = new Set(["gp", "pass_att", "pass_cmp", "rush_att", "rec_tgt"]);
+function scoreStats(stats) {
+  let pts = 0;
+  for (const k in stats) {
+    if (NON_SCORING.has(k)) continue;
+    const w = S.scoring[k];
+    if (typeof w === "number") pts += w * stats[k];
+  }
+  return pts;
+}
+
+// ---------- value model ----------
+const FLEX_ELIG = {
+  FLEX: ["RB", "WR", "TE"],
+  WRRB_FLEX: ["RB", "WR"],
+  WRRB_WRT: ["RB", "WR", "TE"],
+  REC_FLEX: ["WR", "TE"],
+  WRTE_FLEX: ["WR", "TE"],
+  SUPER_FLEX: ["QB", "RB", "WR", "TE"],
+};
+const isFlex = p => !!FLEX_ELIG[p];
+const REAL_POS = ["QB", "RB", "WR", "TE", "K", "DEF"];
+
+// Replacement level = the best player at a position who does NOT get started
+// anywhere in the league. Deriving it from the actual slot list is what makes
+// superflex work: two QB-eligible slots per team drains the QB pool far deeper,
+// the baseline drops, and every real QB's VOR rises without a hand-tuned bonus.
+function computeReplacement(pool) {
+  const byPos = {};
+  for (const p of REAL_POS) byPos[p] = pool.filter(x => x.pos === p).sort((a, b) => b.pts - a.pts);
+  const used = Object.fromEntries(REAL_POS.map(p => [p, 0]));
+
+  for (const slot of S.rosterPos) {
+    if (slot === "BN" || slot === "IR" || slot === "TAXI" || isFlex(slot)) continue;
+    if (byPos[slot]) used[slot] += S.teams;
+  }
+  for (const slot of S.rosterPos) {
+    if (!isFlex(slot)) continue;
+    const elig = FLEX_ELIG[slot].filter(p => byPos[p]);
+    for (let t = 0; t < S.teams; t++) {
+      let best = null;
+      for (const p of elig) {
+        const cand = byPos[p][used[p]];
+        if (cand && (!best || cand.pts > best.pts)) best = { pos: p, pts: cand.pts };
+      }
+      if (best) used[best.pos]++;
+    }
+  }
+  const rep = {};
+  for (const p of REAL_POS) {
+    const list = byPos[p];
+    if (!list.length) { rep[p] = 0; continue; }
+    const i = Math.min(used[p], list.length - 1);
+    rep[p] = list[i] ? list[i].pts : list[list.length - 1].pts;
+  }
+  return rep;
+}
+
+// Blend our model with the market. Ranks (not points) are averaged, because the
+// outside sources only ever give us an ordering. When the league is superflex we
+// use FantasyPros' superflex board and 2QB ADP; ESPN only publishes a 1-QB PPR
+// rank, so its QB ordering is thrown away there rather than dragging QBs down.
+const WEIGHTS = { model: 0.42, ecr: 0.28, adp: 0.20, espn: 0.10 };
+
+// Positions this league actually starts. A league with no K or DEF slot should
+// never see a kicker on its board, let alone be told to draft one.
+function usedPositions() {
+  const set = new Set();
+  for (const slot of S.rosterPos) {
+    if (isFlex(slot)) FLEX_ELIG[slot].forEach(p => set.add(p));
+    else if (REAL_POS.includes(slot)) set.add(slot);
+  }
+  if (!set.size) REAL_POS.forEach(p => set.add(p));
+  return set;
+}
+
+function buildPlayers() {
+  const raw = window.PLAYER_DATA || [];
+  const use = usedPositions();
+  S.usedPos = use;
+  const pool = raw.filter(p => use.has(p.pos)).map(p => ({
+    ...p,
+    key: keyOf(p.name, p.pos),
+    pts: Math.round(scoreStats(p.stats) * 10) / 10,
+    ecr: S.superflex ? (p.fpSf || p.fpHalf) : (p.fpHalf || p.fpSf),
+    tier: S.superflex ? (p.fpSfTier || p.fpHalfTier) : (p.fpHalfTier || p.fpSfTier),
+    adp: S.superflex ? (p.ffc2qb || p.adp2qb) : (p.ffcHalf || p.adpHalf || p.adpPpr),
+  }));
+
+  const rep = computeReplacement(pool);
+  for (const p of pool) p.vor = Math.round((p.pts - (rep[p.pos] ?? 0)) * 10) / 10;
+
+  // rank each signal, then blend the ranks we actually have
+  const rankMap = (list, get) => {
+    const m = new Map();
+    list.filter(p => get(p) != null).sort((a, b) => get(a) - get(b))
+      .forEach((p, i) => m.set(p.key, i + 1));
+    return m;
+  };
+  const rModel = rankMap(pool, p => -p.vor);
+  const rEcr = rankMap(pool, p => p.ecr);
+  const rAdp = rankMap(pool, p => p.adp);
+  const rEspn = rankMap(pool, p => (S.superflex && p.pos === "QB") ? null : p.espn);
+
+  for (const p of pool) {
+    const parts = [
+      [WEIGHTS.model, rModel.get(p.key)],
+      [WEIGHTS.ecr, rEcr.get(p.key)],
+      [WEIGHTS.adp, rAdp.get(p.key)],
+      [WEIGHTS.espn, rEspn.get(p.key)],
+    ].filter(([, r]) => r != null);
+    const wsum = parts.reduce((a, [w]) => a + w, 0) || 1;
+    p.blend = parts.reduce((a, [w, r]) => a + w * r, 0) / wsum;
+    p.sources = parts.length;
+
+    // Expert spread doubles as a risk profile: a big gap between a player's best
+    // and worst expert rank is exactly what "boom/bust" means.
+    const spread = (p.best != null && p.worst != null && p.ecr) ? p.worst - p.best : null;
+    const scale = Math.max(18, p.ecr ? p.ecr * 0.40 : 18);
+    p.upside = spread ? Math.max(1, Math.min(5, Math.round(1 + (p.ecr - p.best) / scale))) : 3;
+    p.risk = spread ? Math.max(1, Math.min(5, Math.round(1 + (p.worst - p.ecr) / scale))) : 3;
+  }
+
+  pool.sort((a, b) => a.blend - b.blend);
+  pool.forEach((p, i) => { p.rank = i + 1; });
+  S.players = pool;
+  S.byKey = new Map(pool.map(p => [p.key, p]));
+  S.replacement = rep;
+}
+
+// ---------- draft structure ----------
+function slotForPick(no) {
+  const t = S.teams, rnd = Math.ceil(no / t), idx = (no - 1) % t;
+  const type = S.draft?.type || "snake";
+  if (type !== "snake") return idx + 1;
+  let rev = rnd % 2 === 0;
+  const rr = S.draft?.settings?.reversal_round || 0;
+  if (rr && rnd >= rr) rev = !rev;          // 3rd-round-reversal style drafts
+  return rev ? t - idx : idx + 1;
+}
+function tradedMap() {
+  const m = new Map();
+  for (const t of S.traded) m.set(t.round + "|" + t.roster_id, t.owner_id);
+  return m;
+}
+function ownerOfPick(no, tmap) {
+  const rnd = Math.ceil(no / S.teams);
+  const orig = (S.draft?.slot_to_roster_id || {})[slotForPick(no)];
+  return tmap.get(rnd + "|" + orig) ?? orig;
+}
+// Picks I still get to make: mine by trade-adjusted ownership, minus any that a
+// keeper has already been slotted into.
+function myPickNumbers() {
+  if (!S.draft || S.myRosterId == null) return [];
+  const rounds = S.draft.settings?.rounds || S.rosterPos.filter(p => p !== "IR" && p !== "TAXI").length;
+  const tmap = tradedMap();
+  const taken = new Set(S.picks.map(p => p.pick_no));
   const out = [];
-  for (let r = 1; r <= CONFIG.rounds; r++) {
-    out.push(r % 2 === 1
-      ? (r - 1) * CONFIG.teams + CONFIG.mySlot
-      : (r - 1) * CONFIG.teams + (CONFIG.teams - CONFIG.mySlot + 1));
+  for (let no = 1; no <= rounds * S.teams; no++) {
+    if (ownerOfPick(no, tmap) === S.myRosterId && !taken.has(no)) out.push(no);
   }
   return out;
 }
 
-function pickInfo(pick) {
-  const m = pick.metadata || {};
-  return {
-    name: `${m.first_name || ""} ${m.last_name || ""}`.trim(),
-    pos: (m.position || "").toUpperCase(),
-    team: m.team || "",
-    key: keyOf(`${m.first_name || ""} ${m.last_name || ""}`, m.position),
-    pickNo: pick.pick_no,
-    by: pick.picked_by || slotToUser[pick.draft_slot] || "",
-  };
+function pickInfo(p) {
+  const m = p.metadata || {};
+  const name = m.position === "DEF" ? (m.last_name || m.first_name || "")
+    : `${m.first_name || ""} ${m.last_name || ""}`.trim();
+  return { name, pos: (m.position || "").toUpperCase(), team: m.team || "",
+           key: keyOf(name, m.position), pickNo: p.pick_no, rosterId: p.roster_id,
+           isKeeper: !!p.is_keeper };
 }
-
-function computeGone() {
-  const gone = new Map(); // key -> {pickNo, byName}
-  for (const p of allPicks()) {
-    const info = pickInfo(p);
-    gone.set(info.key, { pickNo: info.pickNo, byName: USERS[info.by] || `slot ${slotForPickNo(info.pickNo)}` , by: info.by });
+function goneMap() {
+  const g = new Map();
+  for (const pk of S.picks) {
+    const i = pickInfo(pk);
+    g.set(i.key, { pickNo: i.pickNo, rosterId: i.rosterId, keeper: i.isKeeper });
   }
-  return gone;
-}
-
-// ---------- recommendation engine (hero-RB build) ----------
-
-// Talent decays exponentially down the board, so a fixed number of ranks is
-// worth wildly different amounts at the top vs the bottom. Everything is
-// scored through this curve; adjustments shift a player's effective rank
-// rather than his points. Effective rank is deliberately allowed below 1 so
-// the very top of the board doesn't compress into a tie.
-const DECAY = 55;
-const valueAt = r => 1000 * Math.exp((1 - r) / DECAY);
-
-// Score each pick together with what the sim expects to survive to your next
-// turn, rather than in isolation. Set false to fall back to solo scoring.
-const USE_LOOKAHEAD = true;
-
-// Roster-fit portion of the score, split out so it can also be applied to a
-// HYPOTHETICAL roster during lookahead ("if I take the TE now, what does my
-// board look like next turn?"). Pick-timing terms stay in recommend() because
-// they only make sense for the pick actually in front of you.
-function fitSpots(p, c, round, tierLeft) {
-  const why = [];
-  let spots = 0;
-
-  // hero-RB build: 1 anchor RB early, WRs through both flexes, elite TE/QB windows, RB2+ later
-  if (p.pos === "RB") {
-    if (c.RB === 0 && round <= 3) { spots += 7; why.push("hero RB anchor"); }
-    // Hero RB defers RB2 to load WRs first — but that only holds while you're
-    // actually still short at WR. Once the WR corps is built and you're still
-    // on one back, RB2 IS the need, and the flat early-round penalty was
-    // burying it: sims from pick 56 with 1 RB / 3 WR had a tier-2 QB surviving
-    // to the next turn 81% of the time but a tier-4 RB only 32%.
-    else if (c.RB === 1 && c.WR >= 3 && round >= 4) { spots += 5; why.push("RB2 need — WR corps already built"); }
-    else if (c.RB >= 1 && round <= 6) spots -= 14;
-    else if (round >= 7 && c.RB < 4) { spots += 10; why.push("RB2/3 window"); }
-  } else if (p.pos === "WR") {
-    if (c.WR < 6 && round <= 10) { spots += 6; why.push("WR-through-flex build"); }
-    else if (c.WR >= 6) spots -= 12;
-  } else if (p.pos === "TE") {
-    if (c.TE === 0) {
-      // Elite TE is an R2+ luxury, not an R1 one. In round 1 a top-5 overall
-      // skill player is simply worth more than the best TE, so the flex-cheat-code
-      // bonus doesn't apply yet — wanting an elite TE eventually is not a reason
-      // to spend a premium pick on one.
-      if (p.tier === 1 && round >= 2) { spots += 5; why.push("elite TE = flex cheat code"); }
-      else if (round >= 8) { spots += 10; why.push("TE need"); }
-      else spots -= 18;
-    } else spots -= 40;
-  } else if (p.pos === "QB") {
-    if (c.QB === 0) {
-      if (p.tier <= 2 && round >= 4 && round <= 7) { spots += 8; why.push("elite QB value window"); }
-      else if (round >= 8) { spots += 12; why.push("QB need — this league drafts QBs late"); }
-      else spots -= 22;
-    } else spots -= round >= 13 ? 12 : 50;
-  }
-
-  const left = tierLeft[p.pos + p.tier] || 0;
-  if (left === 1) { spots += 9; why.push(`LAST ${p.pos} in tier ${p.tier} — cliff after him`); }
-  else if (left === 2) { spots += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
-
-  return { spots, why };
-}
-
-function countTiers(pool) {
-  const t = {};
-  for (const p of pool) t[p.pos + p.tier] = (t[p.pos + p.tier] || 0) + 1;
-  return t;
-}
-
-// Seeded so the shortlist doesn't reshuffle on every 5s poll.
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-// The actual question at any pick is not "who is best right now" but "which
-// PAIR do I end up with across this pick and my next one". Taking the elite TE
-// at 32 is only correct if the WR still sitting there at 41 is nearly as good
-// as the WR you'd have taken at 32. So: for each candidate, play the draft
-// forward to your next turn with opponents drafting near ADP, then add the
-// value of the best player left for you there.
-function lookahead(cands, avail, counts, nextMine, afterMine, rng, trials) {
-  const gap = afterMine - nextMine - 1;          // opponent picks in between
-  if (gap <= 0) return null;
-  const nextRound = Math.ceil(afterMine / CONFIG.teams);
-  const out = new Map();
-
-  for (const cand of cands) {
-    const c2 = { ...counts };
-    c2[cand.p.pos] = (c2[cand.p.pos] || 0) + 1;
-    let total = 0;
-    const partnerTally = new Map();
-
-    for (let t = 0; t < trials; t++) {
-      // Opponents take the lowest (ADP + noise) still on the board.
-      const taken = new Set([cand.p.key]);
-      for (let g = 0; g < gap; g++) {
-        let bestKey = null, bestVal = Infinity;
-        for (let i = 0; i < avail.length && i < 45; i++) {
-          const p = avail[i];
-          if (taken.has(p.key)) continue;
-          const v = (p.adp || p.rank) + (rng() - 0.5) * 16;
-          if (v < bestVal) { bestVal = v; bestKey = p.key; }
-        }
-        if (bestKey) taken.add(bestKey);
-      }
-      const pool = avail.filter(p => !taken.has(p.key));
-      const tl2 = countTiers(pool);
-      let best = null, bestScore = -Infinity;
-      for (let i = 0; i < pool.length && i < 40; i++) {
-        const p = pool[i];
-        const s = valueAt(p.rank - fitSpots(p, c2, nextRound, tl2).spots);
-        if (s > bestScore) { bestScore = s; best = p; }
-      }
-      total += bestScore;
-      if (best) partnerTally.set(best.name, (partnerTally.get(best.name) || 0) + 1);
+  // Keepers that Sleeper has not yet slotted into a pick still are not draftable.
+  for (const p of S.players) {
+    if (S.keeperIds.has(p.id) && !g.has(p.key)) {
+      const r = S.rosters.find(r => (r.keepers || []).map(String).includes(p.id));
+      g.set(p.key, { pickNo: null, rosterId: r?.roster_id, keeper: true });
     }
-
-    const partner = [...partnerTally.entries()].sort((a, b) => b[1] - a[1])[0];
-    out.set(cand.p.key, { nextValue: total / trials, partner: partner ? partner[0] : null,
-                          partnerOdds: partner ? partner[1] / trials : 0 });
   }
-  return out;
+  return g;
+}
+const isGone = (p, g) => g.has(p.key) || S.manualGone.has(p.key);
+
+function myRoster(gone) {
+  const out = [];
+  for (const [key, v] of gone) {
+    if (v.rosterId !== S.myRosterId) continue;
+    const p = S.byKey.get(key);
+    if (p) out.push(p);
+  }
+  return out.sort((a, b) => b.pts - a.pts);
 }
 
+// ---------- lineup math ----------
+// Greedy best starting lineup for a set of players against this league's slots.
+// Dedicated slots first, then flexes take the best remaining eligible player, so
+// a superflex slot naturally grabs a QB2 when one is on the roster.
+function lineupValue(roster) {
+  const byPos = {};
+  for (const p of roster) (byPos[p.pos] = byPos[p.pos] || []).push(p.pts);
+  for (const k in byPos) byPos[k].sort((a, b) => b - a);
+  const used = {};
+  let total = 0;
+  const take = pos => {
+    const i = used[pos] || 0;
+    if (byPos[pos] && byPos[pos][i] != null) { total += byPos[pos][i]; used[pos] = i + 1; return true; }
+    return false;
+  };
+  for (const slot of S.rosterPos) {
+    if (slot === "BN" || slot === "IR" || slot === "TAXI" || isFlex(slot)) continue;
+    take(slot);
+  }
+  for (const slot of S.rosterPos) {
+    if (!isFlex(slot)) continue;
+    let best = null;
+    for (const pos of FLEX_ELIG[slot]) {
+      const i = used[pos] || 0;
+      const v = byPos[pos] && byPos[pos][i];
+      if (v != null && (!best || v > best.v)) best = { pos, v };
+    }
+    if (best) { total += best.v; used[best.pos] = (used[best.pos] || 0) + 1; }
+  }
+  return total;
+}
+
+// ---------- recommendations ----------
+// The question at a pick is never "who is best" — it is "who will I regret not
+// taking". So each candidate is scored on how much starting-lineup value he adds
+// NOW versus the best I could still get at that position on my next turn, after
+// the room has taken its ADP-expected chunk out of the board.
 function recommend(gone) {
-  const avail = players.filter(p => !isGone(p, gone));
-
-  const currentPick = allPicks().length + 1;
-  const myNos = myPickNos();
-  const nextMine = myNos.find(n => n >= currentPick) || myNos[myNos.length - 1];
-  const afterMine = myNos.find(n => n > nextMine) || nextMine + 24;
-  const round = Math.ceil(nextMine / CONFIG.teams);
-
-  // draft trend: positional run in the last 8 picks
-  const last8 = allPicks().slice(-8).map(p => (p.metadata?.position || "").toUpperCase());
-  const runCounts = {};
-  last8.forEach(pos => runCounts[pos] = (runCounts[pos] || 0) + 1);
-  const runPos = Object.entries(runCounts).find(([, n]) => n >= 4)?.[0] || null;
-
+  const avail = S.players.filter(p => !isGone(p, gone));
+  // Sleeper slots keepers into the LAST rounds before the draft opens, so
+  // "highest pick_no seen" would report a 16-round draft as finished before it
+  // starts. The live pick is the first slot nobody has filled, counting up.
+  const taken = new Set(S.picks.map(p => p.pick_no));
+  let currentPick = 1;
+  while (taken.has(currentPick)) currentPick++;
+  // Picks actually made in order — excludes those parked keeper rows, which
+  // would otherwise read as a QB run in the last 8 picks.
+  const made = S.picks.filter(p => p.pick_no < currentPick);
+  const myNos = myPickNumbers();
+  const nextMine = myNos.find(n => n >= currentPick) ?? null;
+  const afterMine = myNos.find(n => n > (nextMine ?? 0)) ?? null;
+  const round = nextMine ? Math.ceil(nextMine / S.teams) : Math.ceil(currentPick / S.teams);
   const mine = myRoster(gone);
-  const c = { QB: 0, RB: 0, WR: 0, TE: 0 };
-  mine.forEach(p => c[p.pos] = (c[p.pos] || 0) + 1);
 
-  // tier remaining counts
-  const tierLeft = {};
-  for (const p of avail) {
-    const k = p.pos + p.tier;
-    tierLeft[k] = (tierLeft[k] || 0) + 1;
+  // Board state at my NEXT turn: assume the room takes the top ADP players left.
+  const gap = afterMine && nextMine ? afterMine - nextMine - 1 : S.teams - 1;
+  const byAdp = avail.filter(p => p.adp != null).sort((a, b) => a.adp - b.adp);
+  const goneNext = new Set(byAdp.slice(0, Math.max(0, gap)).map(p => p.key));
+  const laterPool = avail.filter(p => !goneNext.has(p.key));
+
+  // Raw ADP is measured in a league where nobody is kept. Here 40-odd players
+  // are already off the board, so every survivor's true draft slot moves up by
+  // however many players ahead of him are gone. Position in the AVAILABLE
+  // ADP order is that corrected number, and it is what "will he last?" needs.
+  const expPick = new Map();
+  byAdp.forEach((p, i) => expPick.set(p.key, currentPick + i));
+
+  const base = lineupValue(mine);
+  const bestLaterGain = {};
+  for (const pos of REAL_POS) {
+    let b = 0;
+    for (const p of laterPool) {
+      if (p.pos !== pos) continue;
+      b = Math.max(b, lineupValue(mine.concat([p])) - base);
+      break; // laterPool is already in board order; the first is the best
+    }
+    bestLaterGain[pos] = b;
   }
 
-  const onClock = currentPick >= nextMine;
+  const posLeftInTier = {};
+  for (const p of avail) {
+    if (!p.tier) continue;
+    const k = p.pos + "|" + p.tier;
+    posLeftInTier[k] = (posLeftInTier[k] || 0) + 1;
+  }
+  // Recent positional run: the room telling you a tier is about to empty.
+  const last = made.slice(-8).map(p => (p.metadata?.position || "").toUpperCase());
+  const runCount = {};
+  last.forEach(p => runCount[p] = (runCount[p] || 0) + 1);
 
-  const scored = avail.slice(0, 60).map(p => {
-    const adp = p.adp || p.rank;
-    // Every adjustment is measured in SPOTS ON THE BOARD, not points, and is
-    // cashed out through valueAt() at the end. A flat point bonus is worth the
-    // same number of ranks everywhere, which is wrong: jumping rank 17 -> 3 is
-    // a different universe from jumping rank 117 -> 103.
-    const fit = fitSpots(p, c, round, tierLeft);
-    const why = fit.why;
-    let spots = fit.spots;
+  // A finished draft (or one where every pick I own is spent) has no decision in
+  // it; scoring the leftovers just produces confident-looking noise.
+  if (nextMine == null) return { list: [], currentPick, nextMine, afterMine, round, mine, avail, made, done: true };
 
-    if (onClock && currentPick - adp > 4) {
-      spots += Math.min(10, (currentPick - adp) / 3);
-      why.push(`falling: ADP ${adp}, on the clock at ${currentPick}`);
+  const scored = avail.slice(0, 70).map(p => {
+    const gain = lineupValue(mine.concat([p])) - base;
+    const wait = bestLaterGain[p.pos] || 0;
+    const why = [];
+    // Core number: value that disappears if you pass.
+    let score = gain - wait;
+
+    if (gain <= 0) why.push("bench depth only");
+    else if (wait === 0) why.push(`fills ${p.pos} — nothing comparable next turn`);
+    else why.push(`+${Math.round(gain)} now vs +${Math.round(wait)} if you wait`);
+
+    const left = p.tier ? posLeftInTier[p.pos + "|" + p.tier] : null;
+    if (left === 1) { score += 8; why.push(`last ${p.pos} in tier ${p.tier}`); }
+    else if (left === 2) { score += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+
+    const exp = expPick.get(p.key);
+    if (exp != null && afterMine && exp > afterMine) {
+      why.push(`should still be there at #${afterMine}`);
+    } else if (exp != null && nextMine && exp <= nextMine + Math.max(1, gap)) {
+      why.push(`expected gone by #${afterMine || nextMine + gap}`);
     }
-    // Availability projections only move the score when you're actually choosing.
-    // Off the clock this panel answers "who's on the board right now", so ADP
-    // forecasts are annotations — otherwise every elite player is buried by a
-    // guess that he won't survive to your turn, which is exactly when you most
-    // want to see that he's still sitting there.
-    if (!onClock && adp < nextMine) {
-      why.push(`likely gone by #${nextMine} (ADP ${adp})`);
-    }
-    // These two are crude proxies for "what survives the round trip". When the
-    // lookahead sim runs it measures that directly, so leave the annotation but
-    // drop the score nudge rather than counting the same effect twice.
-    if (onClock) {
-      if (adp > afterMine + 2) {
-        if (!USE_LOOKAHEAD) spots -= 7;
-        why.push(`can likely wait — ADP ${adp}, you pick again at #${afterMine}`);
-      } else if (adp <= afterMine && adp >= nextMine - 2) {
-        if (!USE_LOOKAHEAD) spots += 4;
-        why.push(`won't last to your next pick (#${afterMine})`);
-      }
-    } else if (adp > afterMine + 2) {
-      why.push(`should last to #${afterMine}`);
-    }
+    if (runCount[p.pos] >= 4) { score += 4; why.push(`${p.pos} run: ${runCount[p.pos]} of last 8`); }
+    if (p.risk >= 5) { score -= 4; why.push("high bust risk"); }
 
-    if (runPos && p.pos === runPos) { spots += 4; why.push(`${runPos} run — ${runCounts[runPos]} of last 8 picks`); }
-    if (currentPick >= 105 && (p.upside || 0) >= 4) { spots += 12; why.push("late-round ceiling swing"); }
-    if ((p.bust || 0) >= 4) { spots -= 4; why.push("high bust risk"); }
-    if (/injury|susp/.test(p.note || "")) { spots -= 3; why.push(`⚠ ${p.note}`); }
-
-    return { p, score: valueAt(p.rank - spots), why };
+    return { p, score, gain, wait, why };
   });
 
   scored.sort((a, b) => b.score - a.score);
 
-  // Pair value: score this pick together with what the sim says survives to
-  // your next one. Only the genuine contenders are simulated — running it on
-  // all 60 would be wasted work, since a player who can't win on his own value
-  // won't win on the pair either.
-  if (USE_LOOKAHEAD) {
-    try {
-      const cands = scored.slice(0, 14);
-      const rng = mulberry32(currentPick * 7919 + avail.length);
-      const la = lookahead(cands, avail, c, nextMine, afterMine, rng, 20);
-      if (la) {
-        for (const s of cands) {
-          const info = la.get(s.p.key);
-          if (!info) continue;
-          s.pairScore = s.score + info.nextValue;
-          if (info.partner) {
-            s.why.push(`then likely ${info.partner} at #${afterMine} (${Math.round(info.partnerOdds * 100)}% of sims)`);
-          }
-        }
-        // Pair scores and solo scores aren't the same currency, so the shortlist
-        // must not mix them — restrict the pool to what was actually simulated.
-        // These were already the top candidates by solo score, so nobody outside
-        // the set was a live option anyway.
-        cands.sort((a, b) => (b.pairScore || 0) - (a.pairScore || 0));
-        scored.length = 0;
-        scored.push(...cands);
-      }
-    } catch (e) {
-      console.warn("lookahead failed, falling back to solo scoring", e);
-    }
-  }
-  // Keep the shortlist positionally diverse so the real alternatives are always
-  // visible. Five options, but graded rather than padded: filling slots
-  // unconditionally is how a rank-17 TE ended up "recommended" at pick 8 just
-  // for being the best of his position. Anyone inside STRONG is a genuine
-  // co-contender; between STRONG and FLOOR is a real but clearly worse option
-  // and gets dimmed; past FLOOR isn't shown at all, so the list can still come
-  // back short in a thin spot.
-  // Pair scores sum two picks, so their spread is compressed relative to solo
-  // scores and both thresholds have to be tighter to mean the same thing.
-  const key = s => (s.pairScore != null ? s.pairScore : s.score);
-  const STRONG = USE_LOOKAHEAD ? 0.95 : 0.90;
-  const FLOOR  = USE_LOOKAHEAD ? 0.85 : 0.78;
-  const top = scored.length ? key(scored[0]) : 0;
+  // Show real alternatives, but graded — anything well below the leader is
+  // dimmed rather than presented as a co-contender.
   const list = [], perPos = {};
+  const top = scored.length ? scored[0].score : 0;
   for (const s of scored) {
-    if (key(s) < top * FLOOR) break;
+    if (list.length >= 6) break;
+    if (top > 0 && s.score < top * 0.45 && list.length >= 3) break;
     if ((perPos[s.p.pos] || 0) >= 2) continue;
     perPos[s.p.pos] = (perPos[s.p.pos] || 0) + 1;
-    s.marginal = key(s) < top * STRONG;
+    s.marginal = top > 0 && s.score < top * 0.75;
     list.push(s);
-    if (list.length === 5) break;
   }
-  return { list, currentPick, nextMine, round };
+  return { list, currentPick, nextMine, afterMine, round, mine, avail, made };
 }
 
-function isGone(p, gone) { return gone.has(p.key) || manualGone.has(p.key); }
-
-function myRoster(gone) {
-  const out = [];
-  for (const pick of allPicks()) {
-    const info = pickInfo(pick);
-    if (info.by === CONFIG.myUserId || (!info.by && slotForPickNo(info.pickNo) === CONFIG.mySlot) || slotForPickNo(info.pickNo) === CONFIG.mySlot && realPicks.length === 0) {
-      // sim picks attribute by slot; real picks by picked_by
-    }
-    const isMine = realPicks.length
-      ? info.by === CONFIG.myUserId
-      : slotForPickNo(info.pickNo) === CONFIG.mySlot;
-    if (isMine) out.push({ name: info.name, pos: info.pos, team: info.team, pickNo: info.pickNo, key: info.key });
+// ---------- polling ----------
+async function poll() {
+  if (!S.league?.draft_id) return;
+  try {
+    const picks = await api(`/draft/${S.league.draft_id}/picks`);
+    S.picks = picks || [];
+    el("sync-info").textContent =
+      `synced ${new Date().toLocaleTimeString()} · ${S.picks.length} picks`;
+  } catch (e) {
+    el("sync-info").textContent = "offline — using manual marks";
   }
-  return out;
-}
-
-// ---------- simulation ----------
-function fakePick(player, pickNo) {
-  const [first, ...rest] = player.name.split(" ");
-  return {
-    pick_no: pickNo, round: Math.ceil(pickNo / CONFIG.teams), draft_slot: slotForPickNo(pickNo),
-    picked_by: slotToUser[slotForPickNo(pickNo)] || "",
-    metadata: { first_name: first, last_name: rest.join(" "), position: player.pos, team: player.team },
-  };
-}
-function simulatePick() {
-  if (realPicks.length) { alert("Real draft has started — sim disabled."); return; }
-  const gone = computeGone();
-  const avail = players.filter(p => !isGone(p, gone));
-  if (!avail.length) return;
-  const jitter = Math.floor(Math.random() * Math.min(5, avail.length));
-  simPicks.push(fakePick(avail[jitter], simPicks.length + 1));
   render();
-}
-function simulateMyPick() {
-  if (realPicks.length) { alert("Real draft has started — sim disabled."); return; }
-  const gone = computeGone();
-  const currentPick = simPicks.length + 1;
-  while (simPicks.length + 1 < myPickNos().find(n => n >= currentPick)) simulatePick();
-  const rec = recommend(computeGone());
-  if (rec.list.length) { simPicks.push(fakePick(rec.list[0].p, simPicks.length + 1)); render(); }
 }
 
 // ---------- render ----------
-function render() {
-  const gone = computeGone();
-  const { list, currentPick, nextMine, round } = recommend(gone);
-  const total = CONFIG.teams * CONFIG.rounds;
-
-  // status bar
-  const st = document.getElementById("draft-status");
-  st.textContent = realPicks.length ? `LIVE — pick ${currentPick}/${total}` :
-    (simPicks.length ? `SIM — pick ${currentPick}/${total}` : `pre-draft`);
-  st.classList.toggle("live", !!realPicks.length);
-  const onClockSlot = slotForPickNo(Math.min(currentPick, total));
-  document.getElementById("clock").textContent =
-    `On the clock: ${USERS[slotToUser[onClockSlot]] || "slot " + onClockSlot} (R${Math.ceil(currentPick / CONFIG.teams)})`;
-  const until = nextMine - currentPick;
-  document.getElementById("mynext").textContent = until <= 0
-    ? "YOU ARE ON THE CLOCK" : `Your pick: #${nextMine} (in ${until})`;
-
-  // recommendations
-  document.getElementById("rec-context").textContent = until <= 0
-    ? `— YOU'RE ON THE CLOCK, pick #${nextMine} (R${round})`
-    : `— best available now · your pick #${nextMine} (R${round})`;
-  // Raw curve values are four-digit and meaningless on their own; show each rec
-  // as a share of the top option so the number answers "how much closer is he?"
-  const val = r => (r.pairScore != null ? r.pairScore : r.score);
-  const topScore = list.length ? val(list[0]) : 1;
-  document.getElementById("recs").innerHTML = list.map((r, i) => `
-    <div class="rec ${i === 0 ? "top" : ""} ${r.marginal ? "marginal" : ""}">
-      <span class="score">${Math.round((val(r) / topScore) * 100)}</span>
-      <div class="name"><span class="pos-${r.p.pos}">${r.p.pos}</span> ${r.p.name} <span style="color:var(--dim)">${r.p.team} · rk ${r.p.rank} · ADP ${r.p.adp || "—"} · T${r.p.tier}</span> ${stars(r.p.upside, "up")}</div>
-      <div class="why">${r.why.join(" · ") || "best available"}</div>
-    </div>`).join("");
-
-  // roster
-  const mine = myRoster(gone);
-  const slots = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX", "FLEX"];
-  const pool = [...mine];
-  const lineup = slots.map(s => {
-    const i = pool.findIndex(p => s === "FLEX" ? ["RB", "WR", "TE"].includes(p.pos) : p.pos === s);
-    return { slot: s, p: i >= 0 ? pool.splice(i, 1)[0] : null };
-  });
-  document.getElementById("roster-count").textContent = `(${mine.length}/${CONFIG.rounds})`;
-  document.getElementById("roster").innerHTML =
-    lineup.map(l => `<div class="slot"><span class="pos">${l.slot}</span>${l.p ? `<span class="pos-${l.p.pos}">${l.p.name}</span>` : `<span class="empty">—</span>`}</div>`).join("")
-    + (pool.length ? `<div class="slot"><span class="pos">BN</span><span>${pool.map(p => p.name).join(", ")}</span></div>` : "");
-
-  // ticker
-  const recent = allPicks().slice(-8).reverse();
-  document.getElementById("ticker").innerHTML = recent.map(p => {
-    const i = pickInfo(p);
-    return `<div>#${i.pickNo} <b>${i.name}</b> ${i.pos} → ${USERS[i.by] || "slot " + slotForPickNo(i.pickNo)}</div>`;
-  }).join("") || `<div>No picks yet.</div>`;
-
-  renderBoard(gone);
+function renderHeaderMeta() {
+  const fmt = S.ppr >= 1 ? "full PPR" : S.ppr > 0 ? `${S.ppr} PPR` : "standard";
+  const slots = S.rosterPos.filter(p => p !== "BN" && p !== "IR" && p !== "TAXI");
+  el("lg-name").textContent = S.league.name;
+  el("lg-sub").textContent =
+    `${S.username} · ${S.teams}-team · ${fmt}${S.superflex ? " · SUPERFLEX" : ""}` +
+    `${S.mySlot ? " · slot " + S.mySlot : ""} · ${slots.length} starters` +
+    `${S.draft ? " · " + S.draft.type : ""}`;
+  const m = window.DATA_META || {};
+  el("src-note").innerHTML =
+    `Ranks blend our projection model (${(WEIGHTS.model * 100) | 0}%), FantasyPros ECR (${(WEIGHTS.ecr * 100) | 0}%), ` +
+    `live ADP (${(WEIGHTS.adp * 100) | 0}%) and ESPN (${(WEIGHTS.espn * 100) | 0}%). ` +
+    `Points come from <b>your</b> league's scoring settings; VOR from your roster slots. ` +
+    `Sources: ${esc(m.sources?.fantasypros_superflex || "")} · ${esc(m.sources?.ffc_2qb || "")} · built ${esc((m.built || "").slice(0, 16))}.`;
 }
 
 function stars(n, cls) {
@@ -535,76 +516,179 @@ function stars(n, cls) {
   return `<span class="stars ${cls}">${"★".repeat(n)}${"☆".repeat(5 - n)}</span>`;
 }
 
-function renderBoard(gone) {
-  const hideDrafted = document.getElementById("hide-drafted").checked;
-  const list = players.filter(p => activeTab === "ALL" || p.pos === activeTab);
-  // Tier bands only mean something within a position (an RB tier 1 and a WR
-  // tier 1 are unrelated), so the ALL view can't group by them — there the tier
-  // rides along in the POS cell as RB1/WR2/etc.
-  const byTier = activeTab !== "ALL";
-  let rows = "", lastTier = null;
+function render() {
+  if (!S.league) return;
+  const gone = goneMap();
+  const R = recommend(gone);
+  const rounds = S.draft?.settings?.rounds || 15;
+  const total = S.teams * rounds;
 
-  // tier cliff info (per position)
-  const tierLeft = {};
-  players.forEach(p => { if (!isGone(p, gone)) tierLeft[p.pos + p.tier] = (tierLeft[p.pos + p.tier] || 0) + 1; });
+  const st = el("draft-status");
+  const live = !!S.draft && S.draft.status !== "pre_draft" && R.made.length > 0;
+  st.textContent = S.draft
+    ? (live ? `LIVE — pick ${R.currentPick}/${total}` : `${S.draft.status} — ${total} picks`)
+    : "no draft";
+  st.classList.toggle("live", live);
 
+  const onSlot = slotForPick(Math.min(R.currentPick, total));
+  const onRid = (S.draft?.slot_to_roster_id || {})[onSlot];
+  const onOwner = S.rosterById[onRid]?.owner_id;
+  el("clock").textContent = S.draft
+    ? `On the clock: ${S.users[onOwner] || "slot " + onSlot} (R${Math.ceil(R.currentPick / S.teams)})` : "";
+
+  const until = R.nextMine ? R.nextMine - R.currentPick : null;
+  el("mynext").textContent = R.nextMine == null ? "no picks left"
+    : until <= 0 ? "YOU ARE ON THE CLOCK" : `Your pick: #${R.nextMine} (in ${until})`;
+
+  el("rec-context").textContent = R.nextMine == null ? "" :
+    until <= 0 ? `— ON THE CLOCK, #${R.nextMine} (R${R.round})`
+               : `— your pick #${R.nextMine} (R${R.round})`;
+
+  el("recs").innerHTML = R.list.map((r, i) => `
+    <div class="rec ${i === 0 ? "top" : ""} ${r.marginal ? "marginal" : ""}">
+      <span class="score">${r.score > 0 ? "+" : ""}${Math.round(r.score)}</span>
+      <div class="name"><span class="pos-${r.p.pos}">${r.p.pos}</span> ${esc(r.p.name)}
+        <span class="meta">${esc(r.p.team)} · ${Math.round(r.p.pts)} pts · VOR ${Math.round(r.p.vor)}${r.p.tier ? " · T" + r.p.tier : ""}</span>
+      </div>
+      <div class="why">${r.why.map(esc).join(" · ")}</div>
+    </div>`).join("") || `<div class="rec"><div class="why">${R.done
+      ? "No picks left to make — this draft is done for you."
+      : "No recommendations — the board is empty."}</div></div>`;
+
+  // roster by slot
+  const pool = R.mine.slice();
+  const slots = S.rosterPos.filter(p => p !== "IR" && p !== "TAXI");
+  const rows = [];
+  const usedIdx = new Set();
+  const grab = elig => {
+    let bi = -1;
+    pool.forEach((p, i) => {
+      if (usedIdx.has(i) || !elig.includes(p.pos)) return;
+      if (bi < 0 || p.pts > pool[bi].pts) bi = i;
+    });
+    if (bi >= 0) { usedIdx.add(bi); return pool[bi]; }
+    return null;
+  };
+  for (const slot of slots) {
+    if (slot === "BN") continue;
+    const elig = isFlex(slot) ? FLEX_ELIG[slot] : [slot];
+    rows.push({ slot, p: grab(elig) });
+  }
+  const bench = pool.filter((_, i) => !usedIdx.has(i));
+  el("roster-count").textContent = `(${R.mine.length})`;
+  el("roster").innerHTML = rows.map(r =>
+    `<div class="slot"><span class="pos">${r.slot.replace("SUPER_FLEX", "SFLX").replace("_FLEX", "FLX")}</span>` +
+    (r.p ? `<span class="pos-${r.p.pos}">${esc(r.p.name)}</span><span class="rpts">${Math.round(r.p.pts)}</span>`
+         : `<span class="empty">—</span>`) + `</div>`).join("") +
+    (bench.length ? `<div class="slot"><span class="pos">BN</span><span class="bn">${bench.map(p => esc(p.name)).join(", ")}</span></div>` : "");
+
+  const remaining = myPickNumbers().filter(n => n >= R.currentPick);
+  el("mypicks").innerHTML = remaining.length
+    ? `<div class="picks">Your picks: ${remaining.slice(0, 10).map(n => `#${n}`).join(" · ")}${remaining.length > 10 ? " …" : ""}</div>` : "";
+
+  el("ticker").innerHTML = R.made.slice().sort((a, b) => b.pick_no - a.pick_no).slice(0, 8).map(p => {
+    const i = pickInfo(p);
+    const owner = S.users[S.rosterById[i.rosterId]?.owner_id] || `roster ${i.rosterId}`;
+    return `<div>#${i.pickNo} <b>${esc(i.name)}</b> ${esc(i.pos)} → ${esc(owner)}${i.isKeeper ? " <i>(keeper)</i>" : ""}</div>`;
+  }).join("") || `<div>No picks yet.</div>`;
+
+  renderBoard(gone, R);
+}
+
+function renderBoard(gone, R) {
+  const hide = el("hide-drafted").checked;
+  const list = S.players.filter(p => S.activeTab === "ALL" || p.pos === S.activeTab);
+  const byTier = S.activeTab !== "ALL";
+  const left = {};
+  for (const p of S.players) if (!isGone(p, gone) && p.tier) {
+    left[p.pos + "|" + p.tier] = (left[p.pos + "|" + p.tier] || 0) + 1;
+  }
+  let rows = "", lastTier = null, shown = 0;
   for (const p of list) {
+    if (shown >= 300) break;
     const g = isGone(p, gone);
-    if (hideDrafted && g) continue;
+    if (hide && g) continue;
+    shown++;
     if (byTier && p.tier !== lastTier) {
       lastTier = p.tier;
-      const left = tierLeft[p.pos + p.tier] || 0;
-      rows += `<tr class="tier-row"><td colspan="9" class="tier-head">Tier ${p.tier}${left <= 2 && left > 0 ? `<span class="cliff">⚠ only ${left} left</span>` : ""}${left === 0 ? `<span class="cliff">gone</span>` : ""}</td></tr>`;
+      const n = left[p.pos + "|" + p.tier] || 0;
+      rows += `<tr><td colspan="9" class="tier-head">Tier ${p.tier ?? "—"}` +
+        (n > 0 && n <= 2 ? `<span class="cliff">only ${n} left</span>` : n === 0 ? `<span class="cliff">gone</span>` : "") + `</td></tr>`;
     }
-    const taken = gone.get(p.key);
-    const manual = manualGone.has(p.key);
-    const isMine = taken && taken.by === CONFIG.myUserId;
-    const badges = [
-      p.note && /sleeper|rookie|upside/.test(p.note) ? `<span class="badge up">${p.note}</span>` : "",
-      p.note && /injury|susp/.test(p.note) ? `<span class="badge warn">${p.note}</span>` : "",
-      isMine ? `<span class="badge mine">MINE</span>` : "",
-    ].join("");
-    const val = p.adp ? Math.round(p.adp - p.rank) : 0;
-    rows += `<tr class="player ${g ? "gone" : ""} ${isMine ? "mine-row" : ""}" data-key="${p.key}">
+    const t = gone.get(p.key);
+    const isMine = t && t.rosterId === S.myRosterId;
+    const owner = t ? (S.users[S.rosterById[t.rosterId]?.owner_id] || "") : "";
+    const diff = p.adp != null ? Math.round(p.adp - p.rank) : null;
+    rows += `<tr class="player ${g ? "gone" : ""} ${isMine ? "mine-row" : ""}" data-key="${esc(p.key)}">
       <td class="rk">${p.rank}</td>
-      <td class="nm">${p.name}${badges}</td>
-      <td class="pos pos-${p.pos}">${p.pos}${p.tier}</td>
-      <td class="tm">${p.team}</td>
-      <td class="adp">${p.adp || "—"}</td>
-      <td class="val ${val >= 3 ? "pos" : val <= -3 ? "neg" : ""}">${val > 0 ? "+" + val : val || ""}</td>
-      <td>${stars(p.upside, "up")}</td>
-      <td>${stars(p.bust, "bust")}</td>
-      <td class="taken">${taken ? `#${taken.pickNo} ${taken.byName}` : manual ? "manual ✕" : ""}</td>
+      <td class="nm">${esc(p.name)}${isMine ? ' <span class="badge mine">MINE</span>' : ""}${t?.keeper ? ' <span class="badge kp">KEPT</span>' : ""}</td>
+      <td class="pos pos-${p.pos}">${p.pos}${p.tier || ""}</td>
+      <td class="tm">${esc(p.team)}</td>
+      <td class="num">${Math.round(p.pts)}</td>
+      <td class="num vor">${Math.round(p.vor)}</td>
+      <td class="num">${p.ecr || "—"}</td>
+      <td class="num adp ${diff >= 8 ? "pos" : diff <= -8 ? "neg" : ""}">${p.adp != null ? Math.round(p.adp) : "—"}</td>
+      <td class="taken">${t ? (t.keeper ? "keeper " : "#" + t.pickNo + " ") + esc(owner) : S.manualGone.has(p.key) ? "manual ✕" : ""}</td>
     </tr>`;
   }
-  const el = document.getElementById("players");
-  el.innerHTML = `<table class="sheet">
-    <thead><tr>
-      <th title="My consensus rank — where this board says he should go overall.">RK</th>
-      <th>PLAYER</th>
-      <th title="Position + tier. RB1 = tier-1 RB. Tap a position tab for tier bands and cliff warnings.">POS</th>
-      <th>TM</th>
-      <th title="Average Draft Position — where the market actually drafts him.">ADP</th>
-      <th class="help" id="th-val" title="ADP minus rank: how many picks of value he is. Green = he lasts longer than he's worth (bargain), red = you'd have to reach. Tap for details.">+/-</th>
-      <th title="Ceiling, 1-5. How big his best-case season is.">UPSIDE</th>
-      <th title="Floor risk, 1-5. How likely he busts.">BUST</th>
-      <th>DRAFTED</th>
-    </tr></thead>
-    <tbody>${rows}</tbody></table>`;
-  // title= is useless on a phone, so the +/- header also toggles a real legend.
-  // The table is rebuilt on every poll, so this rebinds each render.
-  const vh = document.getElementById("th-val");
-  if (vh) vh.addEventListener("click", () => {
-    const lg = document.getElementById("legend");
-    lg.hidden = !lg.hidden;
-  });
+  el("players").innerHTML = `<table class="sheet"><thead><tr>
+      <th title="Blended rank: our model, FantasyPros ECR, live ADP, ESPN.">RK</th>
+      <th>PLAYER</th><th>POS</th><th>TM</th>
+      <th class="num" title="Season projection scored with YOUR league's settings.">PTS</th>
+      <th class="num help" id="th-vor" title="Value over replacement in your league. Tap for details.">VOR</th>
+      <th class="num" title="FantasyPros expert consensus rank.">ECR</th>
+      <th class="num" title="Live ADP — where the market drafts him.">ADP</th>
+      <th>STATUS</th></tr></thead><tbody>${rows}</tbody></table>`;
 
-  el.querySelectorAll("tr.player").forEach(row => row.addEventListener("click", () => {
+  const vh = el("th-vor");
+  if (vh) vh.addEventListener("click", () => { el("legend").hidden = !el("legend").hidden; });
+  el("players").querySelectorAll("tr.player").forEach(row => row.addEventListener("click", () => {
     const k = row.dataset.key;
-    if (manualGone.has(k)) manualGone.delete(k); else manualGone.add(k);
-    localStorage.setItem("fcffl_manual", JSON.stringify([...manualGone]));
+    if (S.manualGone.has(k)) S.manualGone.delete(k); else S.manualGone.add(k);
+    localStorage.setItem(LS.manual + S.league.league_id, JSON.stringify([...S.manualGone]));
     render();
   }));
 }
 
-init();
+// ---------- wiring ----------
+function syncHeaderOffset() {
+  const h = document.querySelector("header");
+  if (h) document.documentElement.style.setProperty("--hdr", Math.round(h.getBoundingClientRect().height) + "px");
+}
+let wired = false;
+function wireApp() {
+  syncHeaderOffset();
+  if (wired) return;
+  wired = true;
+  if (window.ResizeObserver) new ResizeObserver(syncHeaderOffset).observe(document.querySelector("header"));
+  window.addEventListener("resize", syncHeaderOffset);
+  document.querySelectorAll(".tab").forEach(b => {
+    if (b.dataset.pos !== "ALL" && S.usedPos && !S.usedPos.has(b.dataset.pos)) b.hidden = true;
+  });
+  document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
+    S.activeTab = b.dataset.pos;
+    document.querySelectorAll(".tab").forEach(x => x.classList.toggle("active", x === b));
+    render();
+  }));
+  el("hide-drafted").addEventListener("change", render);
+  el("switch-league").addEventListener("click", () => {
+    if (S.pollTimer) clearInterval(S.pollTimer);
+    showSetup("");
+    findLeagues();
+  });
+}
+
+el("su-go").addEventListener("click", findLeagues);
+el("su-user").addEventListener("keydown", e => { if (e.key === "Enter") findLeagues(); });
+
+// Come back to the league you were drafting in, not the setup form.
+(function boot() {
+  const u = localStorage.getItem(LS.user), s = localStorage.getItem(LS.season), l = localStorage.getItem(LS.league);
+  if (u) el("su-user").value = u;
+  if (s) el("su-season").value = s;
+  if (u && l) {
+    S.username = u; S.season = s || "2026";
+    api(`/user/${encodeURIComponent(u)}`).then(x => { S.userId = x.user_id; return loadLeague(l); })
+      .catch(() => showSetup(""));
+  } else showSetup("");
+})();
