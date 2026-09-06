@@ -33,10 +33,18 @@ const keyOf = (name, pos) => norm(name) + "|" + (pos || "").toUpperCase();
 const el = id => document.getElementById(id);
 const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-async function api(path) {
-  const r = await fetch(API + path, { cache: "no-store" });
-  if (!r.ok) throw new Error(`${r.status} on ${path}`);
-  return r.json();
+// Timed out on purpose: a Sleeper call that never settles used to leave the
+// setup card sitting on "loading league..." with nothing to act on.
+async function api(path, ms = 12000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(API + path, { cache: "no-store", signal: ctl.signal });
+    if (!r.ok) throw new Error(`${r.status} on ${path}`);
+    return await r.json();
+  } catch (e) {
+    throw new Error(e.name === "AbortError" ? `timed out on ${path}` : e.message);
+  } finally { clearTimeout(t); }
 }
 
 // ---------- setup ----------
@@ -144,7 +152,7 @@ async function loadLeague(leagueId) {
     if (S.pollTimer) clearInterval(S.pollTimer);
     S.pollTimer = setInterval(poll, POLL_MS);
   } catch (e) {
-    showSetup("Couldn't load that league: " + e.message);
+    showSetup(`Couldn't load that league: ${e.message}. Tap it again to retry.`);
   }
 }
 
