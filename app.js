@@ -397,6 +397,20 @@ function lineupValue(roster) {
   return total;
 }
 
+// Which starting slots a position can legally occupy — used to explain why a
+// player adds nothing (e.g. "QB and SUPER_FLEX already filled").
+function starterSlotsFor(pos) {
+  const names = [];
+  for (const slot of S.rosterPos) {
+    if (slot === "BN" || slot === "IR" || slot === "TAXI") continue;
+    if (slot === pos || (isFlex(slot) && FLEX_ELIG[slot].includes(pos))) {
+      const label = slot.replace(/_/g, " ");
+      if (!names.includes(label)) names.push(label);
+    }
+  }
+  return names.length ? names.join(" and ") : null;
+}
+
 // ---------- recommendations ----------
 // The question at a pick is never "who is best" — it is "who will I regret not
 // taking". So each candidate is scored on how much starting-lineup value he adds
@@ -435,11 +449,13 @@ function recommend(gone) {
   const base = lineupValue(mine);
   const bestLaterGain = {};
   for (const pos of REAL_POS) {
-    let b = 0;
+    let b = 0, seen = 0;
     for (const p of laterPool) {
       if (p.pos !== pos) continue;
       b = Math.max(b, lineupValue(mine.concat([p])) - base);
-      break; // laterPool is already in board order; the first is the best
+      // Board order is blended rank, which is not the same as most lineup value,
+      // so check a few rather than trusting the first one.
+      if (++seen >= 5) break;
     }
     bestLaterGain[pos] = b;
   }
@@ -464,15 +480,34 @@ function recommend(gone) {
     const wait = bestLaterGain[p.pos] || 0;
     const why = [];
     // Core number: value that disappears if you pass.
-    let score = gain - wait;
+    const core = gain - wait;
 
-    if (gain <= 0) why.push("bench depth only");
-    else if (wait === 0) why.push(`fills ${p.pos} — nothing comparable next turn`);
-    else why.push(`+${Math.round(gain)} now vs +${Math.round(wait)} if you wait`);
-
+    // Scarcity and momentum are MULTIPLIERS on real value, never flat additions.
+    // As flat bonuses they lifted players who cannot enter the lineup at all --
+    // a third QB once QB and SUPER_FLEX are filled adds exactly 0, and +8 for a
+    // thin tier still ranked him over a receiver who would actually start.
+    let mult = 1;
     const left = p.tier ? posLeftInTier[p.pos + "|" + p.tier] : null;
-    if (left === 1) { score += 8; why.push(`last ${p.pos} in tier ${p.tier}`); }
-    else if (left === 2) { score += 4; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+    if (left === 1) { mult += 0.28; why.push(`last ${p.pos} in tier ${p.tier}`); }
+    else if (left === 2) { mult += 0.14; why.push(`only 2 left in ${p.pos} tier ${p.tier}`); }
+    if (runCount[p.pos] >= 4) { mult += 0.14; why.push(`${p.pos} run: ${runCount[p.pos]} of last 8`); }
+    if (p.risk >= 5) { mult -= 0.10; why.push("high bust risk"); }
+
+    let score;
+    if (gain <= 0) {
+      // Depth has some value (bye weeks, injuries, trade bait) but it must never
+      // outrank someone who improves the lineup today.
+      score = Math.max(0, p.vor) * 0.02;
+      const full = starterSlotsFor(p.pos);
+      why.unshift(full
+        ? `doesn't crack your lineup — ${full} already filled`
+        : "bench depth only");
+    } else {
+      score = core * mult;
+      why.unshift(wait <= 0
+        ? `fills ${p.pos} — nothing comparable next turn`
+        : `+${Math.round(gain)} now vs +${Math.round(wait)} if you wait`);
+    }
 
     const exp = expPick.get(p.key);
     if (exp != null && afterMine && exp > afterMine) {
@@ -480,8 +515,6 @@ function recommend(gone) {
     } else if (exp != null && nextMine && exp <= nextMine + Math.max(1, gap)) {
       why.push(`expected gone by #${afterMine || nextMine + gap}`);
     }
-    if (runCount[p.pos] >= 4) { score += 4; why.push(`${p.pos} run: ${runCount[p.pos]} of last 8`); }
-    if (p.risk >= 5) { score -= 4; why.push("high bust risk"); }
 
     return { p, score, gain, wait, why };
   });
