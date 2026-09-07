@@ -503,10 +503,14 @@ function recommend(gone) {
         ? `doesn't crack your lineup — ${full} already filled`
         : "bench depth only");
     } else {
-      score = core * mult;
-      why.unshift(wait <= 0
-        ? `fills ${p.pos} — nothing comparable next turn`
-        : `+${Math.round(gain)} now vs +${Math.round(wait)} if you wait`);
+      // Rank on what he ADDS, with scarcity as a premium on top. Ranking on the
+      // delta alone degenerates whenever your picks are close together: with one
+      // pick between turns, everybody's "cost of waiting" is zero and the whole
+      // board ties, so the order became arbitrary.
+      score = (gain + Math.max(0, core) * 0.8) * mult;
+      why.unshift(`+${Math.round(gain)} to your lineup`);
+      if (core > 1) why.push(`${Math.round(core)} of that is lost if you wait`);
+      else why.push(`similar still there at #${afterMine || "your next pick"}`);
     }
 
     const exp = expPick.get(p.key);
